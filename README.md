@@ -96,10 +96,10 @@ shellmates-discord-bot/
 # DCIT-Bot additions:
 
 ## base objectives
-- `use of ALG_Cyber_2009_FR_0 and 2.1-Loi-N%C2%B018-07-2 from the official course material`
+- use of `ALG_Cyber_2009_FR_0` and `2.1-Loi-N%C2%B018-07-2 from the official course material`
+- add the official algerian juridical laws about cybercrime and digital citizenship`
 
 ## nice to have objectives
-- `add the official algerian juridical laws about cybercrime and digital citizenship`
-
-## great stretch objectives
-- `Finetune llama in french to comply with the DCIT's strict french requirements`
+- Finetune llama in french to comply with the DCIT's strict french requirements
+- Translate all the juridical texts into french using DeepL
+- Implement a priority system for the juridical texts based on tiers
