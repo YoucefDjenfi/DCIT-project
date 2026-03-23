@@ -100,6 +100,7 @@ shellmates-discord-bot/
 - Add the official algerian juridical laws about cybercrime and digital citizenship`
 
 ## nice to have objectives
+- Clean the juridical texts for filler and boilerplate to reduce hallucinations
 - Finetune llama in french to comply with the DCIT's strict french requirements
 - Translate all the juridical texts into french using DeepL
 - Implement a priority system for the juridical texts based on tiers
