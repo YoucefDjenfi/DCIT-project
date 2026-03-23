@@ -3,7 +3,6 @@ import logging
 from config import Config
 from bot.bot import DiscordBot
 from utils.helpers import setup_logging
-import os
 
 
 def main():
