@@ -92,3 +92,14 @@ shellmates-discord-bot/
 ├── main.py # Application entry point
 └── requirements.txt # Python dependencies
 ```
+
+# DCIT-Bot additions:
+
+## base objectives
+- `use of ALG_Cyber_2009_FR_0 and 2.1-Loi-N%C2%B018-07-2 from the official course material`
+
+## nice to have objectives
+- `add the official algerian juridical laws about cybercrime and digital citizenship`
+
+## great stretch objectives
+- `Finetune llama in french to comply with the DCIT's strict french requirements`
