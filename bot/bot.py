@@ -50,9 +50,14 @@ class DiscordBot(commands.Bot):
                 logger.error(f"✗ Failed to load {ext}: {e}")
 
     async def on_ready(self):
-        logger.info(f"Bot ready! Logged in as {self.user} (ID: {self.user})")
-        logger.info(f"Connected to {len(self.guilds)} guild(s)")
-
+    logger.info(f"Bot ready! Logged in as {self.user} (ID: {self.user})")
+    logger.info(f"Connected to {len(self.guilds)} guild(s)")
+    try:
+        synced = await self.tree.sync()
+        logger.info(f"✓ Synced {len(synced)} slash command(s)")
+    except Exception as e:
+        logger.error(f"✗ Failed to sync commands: {e}")
+    
     async def close(self):
         db.close_all_connections()
         await super().close()
