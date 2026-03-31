@@ -36,7 +36,7 @@ DISTANCE_THRESHOLD = 0.65       # cosine distance above which a chunk is "not re
                                  # (lower = more similar; 0.0 = identical, 1.0 = unrelated)
 MAX_CONTEXT_CHUNKS = 5           # total chunks sent to the LLM
 
-GROQ_MODEL = "llama3-70b-8192"   # best quality on free tier
+GROQ_MODEL = "llama-3.3-70b-versatile"   # best quality on free tier
 
 # ── Module-level initialisation (runs once at import) ────────────────────────
 
