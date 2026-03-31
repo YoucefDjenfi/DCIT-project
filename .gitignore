@@ -7,3 +7,26 @@ __pycache__/
 
 # Environment files
 .env
+
+# ChromaDB — auto-generated, rebuild with ingest.py
+chroma_db/
+
+# PDF knowledge base — often large; document sources in README instead
+knowledge_base/
+
+# PyCharm project files — IDE-specific, not part of the project
+.idea/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# OS junk
+.DS_Store
+Thumbs.db
