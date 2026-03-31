@@ -30,7 +30,9 @@ class Database:
         )
         print("Connection pool created successfully")
 
-    async def get_connection(self):
+    # NOTE: kept as a regular (non-async) method so existing repository code
+    # that calls db.get_connection() without await continues to work.
+    def get_connection(self):
         self._ensure_pool()
         return self.connection_pool.getconn()
 
