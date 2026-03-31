@@ -11,33 +11,43 @@ class Database:
         # This lets the bot start even without a PostgreSQL server running.
         self.connection_pool = None
 
-    def _ensure_pool(self):
-        """Create the connection pool on first use. Raises if DB is not configured."""
+    def _ensure_pool(self) -> bool:
+        """
+        Create the connection pool on first use.
+        Returns True if ready, False if DB is not configured.
+        Never raises — DB-dependent cogs check the return value.
+        """
         if self.connection_pool is not None:
-            return
+            return True
         if not Config.DATABASE_URL and not Config.DB_HOST:
-            raise RuntimeError(
-                "No database configured. Set DB_URL or DB_HOST in your .env file."
+            return False
+        try:
+            self.connection_pool = pool.ThreadedConnectionPool(
+                minconn=Config.DB_POOL_MIN,
+                maxconn=Config.DB_POOL_MAX,
+                host=Config.DB_HOST,
+                port=Config.DB_PORT,
+                database=Config.DB_NAME,
+                user=Config.DB_USER,
+                password=Config.DB_PASSWORD,
             )
-        self.connection_pool = pool.ThreadedConnectionPool(
-            minconn=Config.DB_POOL_MIN,
-            maxconn=Config.DB_POOL_MAX,
-            host=Config.DB_HOST,
-            port=Config.DB_PORT,
-            database=Config.DB_NAME,
-            user=Config.DB_USER,
-            password=Config.DB_PASSWORD,
-        )
-        print("Connection pool created successfully")
+            print("Connection pool created successfully")
+            return True
+        except Exception as e:
+            print(f"Connection pool failed: {e}")
+            return False
 
-    # NOTE: kept as a regular (non-async) method so existing repository code
-    # that calls db.get_connection() without await continues to work.
     def get_connection(self):
-        self._ensure_pool()
+        """
+        Returns a connection from the pool, or None if no DB is configured.
+        Callers must check for None before using the connection.
+        """
+        if not self._ensure_pool():
+            return None
         return self.connection_pool.getconn()
 
     def return_connection(self, connection):
-        if self.connection_pool:
+        if connection and self.connection_pool:
             self.connection_pool.putconn(connection)
 
     def close_all_connections(self):
