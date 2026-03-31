@@ -1,7 +1,6 @@
 import os
 from dotenv import load_dotenv
 
-
 load_dotenv()
 
 
@@ -10,7 +9,10 @@ class Config:
     DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN") or ""
     COMMAND_PREFIX: str = "/"
 
-    # DB Configuration
+    # Groq API
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY") or ""
+
+    # DB Configuration (optional — not required for DCIT RAG feature)
     DATABASE_URL: str | None = os.getenv("DB_URL")
     DB_HOST: str | None = os.getenv("DB_HOST")
     DB_PORT: str | None = os.getenv("DB_PORT")
@@ -22,7 +24,10 @@ class Config:
 
     @classmethod
     def validate(cls):
+        # Only DISCORD_TOKEN is strictly required to run the bot.
+        # DATABASE_URL is optional — DB-dependent cogs will fail gracefully
+        # if no DB is configured, but the RAG feature will still work.
         if not cls.DISCORD_TOKEN:
             raise ValueError("DISCORD_TOKEN is not set in environment variables")
-        if not cls.DATABASE_URL:
-            raise ValueError("DATABASE_URL is not set in environment variables")
+        if not cls.GROQ_API_KEY:
+            raise ValueError("GROQ_API_KEY is not set in environment variables")
