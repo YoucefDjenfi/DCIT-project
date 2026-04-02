@@ -1,10 +1,9 @@
 """
-ingest.py  v4
+ingest.py  v5
 ─────────────
-Key change: Penal Code ingested in FULL (no page range, no keyword filter).
-Page index 118 (PDF page 119) contains art. 394 bis — confirmed by user's
-diagnostic script. Ingesting the full PDF ensures we never miss TIC articles
-regardless of which PDF version is used. The cross-encoder handles precision.
+Removed ALL page/keyword filtering from the Penal Code.
+The full 362-page PDF is ingested. The cross-encoder handles precision.
+18 chunks from 4 pages is not enough — we need all TIC articles.
 """
 
 import re
@@ -51,6 +50,7 @@ def clean_text(text: str) -> str:
 
 
 def extract_pages(pdf_path: str) -> list[tuple[str, int]]:
+    """Extract ALL pages — no filtering. Cross-encoder handles relevance."""
     pages = []
     try:
         reader = PdfReader(pdf_path)
@@ -174,6 +174,7 @@ def build_database():
     for tier in [1, 2, 3]:
         n = sum(1 for c in all_chunks if c["priority"] == tier)
         print(f"  Priority {tier}: {n} chunks")
+    print(f"\nPenal Code chunks: {sum(1 for c in all_chunks if '2016_Algeria_fr_Code Penal' in c['source'])}")
 
 
 if __name__ == "__main__":
