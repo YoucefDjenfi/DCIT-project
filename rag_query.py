@@ -1,23 +1,23 @@
 """
-rag_query.py
-────────────
-RAG engine with query expansion for technical cybersecurity terms.
-
-Key improvements over v1:
-- Query expansion: technical terms (Nmap, DDoS, phishing, etc.) are
-  automatically enriched with their French legal equivalents before
-  embedding, bridging the gap between student vocabulary and legal text
-- Model updated to llama-3.3-70b-versatile (llama3-70b-8192 decommissioned)
-- Distance threshold tuned for the cleaned, smaller corpus
+rag_query.py  v3
+────────────────
+Changes from v2:
+- Cross-encoder reranker: initial retrieval fetches 20 candidates, then a
+  cross-encoder scores each (question, chunk) pair semantically. This fixes
+  the Nmap problem — the Penal Code chunk about "accès frauduleux" now ranks
+  above the Loi 18-07 chunk about "réseaux publics" even though cosine
+  similarity favoured 18-07.
+- max_tokens reduced to 450 so responses fit Discord without truncation
+- System prompt hardened: 4-sentence limit, no hedging unless genuinely absent
+- Query expansion extended with article numbers as search terms
 """
 
-import os
 import sys
 import logging
 import re
 from pathlib import Path
 
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 import chromadb
 from groq import Groq
 
@@ -28,135 +28,142 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-CHROMA_DB_DIR = "./chroma_db"
-COLLECTION_NAME = "cyber_law"
-EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+CHROMA_DB_DIR       = "./chroma_db"
+COLLECTION_NAME     = "cyber_law"
+EMBEDDING_MODEL     = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-PRIORITY_1_MIN_RESULTS = 3
-DISTANCE_THRESHOLD = 0.70
-MAX_CONTEXT_CHUNKS = 5
+GROQ_MODEL          = "llama-3.3-70b-versatile"
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+# Retrieval: fetch wide, then rerank down to a small context
+INITIAL_FETCH       = 20    # candidates pulled from ChromaDB before reranking
+MAX_CONTEXT_CHUNKS  = 4     # chunks actually sent to the LLM after reranking
+DISTANCE_THRESHOLD  = 0.80  # looser than before — reranker does precision work
 
-# ── Query expansion dictionary ────────────────────────────────────────────────
-# Maps technical cybersecurity terms to French legal equivalents.
-# When a user query contains a key, the corresponding legal terms are
-# appended to the query BEFORE embedding, improving retrieval.
+# ── Query expansion ────────────────────────────────────────────────────────────
 
 QUERY_EXPANSION: dict[str, list[str]] = {
-    # Network scanning / reconnaissance
-    "nmap": ["accès frauduleux", "système de traitement automatisé de données", "intrusion réseau", "scan réseau non autorisé"],
-    "scan": ["accès frauduleux", "système de traitement automatisé", "intrusion"],
-    "scanning": ["accès frauduleux", "système de traitement automatisé"],
-    "reconnaissance": ["accès frauduleux", "système informatique", "données informatiques"],
-    "wireshark": ["interception", "écoute réseau", "données informatiques", "accès frauduleux"],
+    "nmap": [
+        "accès frauduleux", "système de traitement automatisé de données",
+        "intrusion réseau", "394 bis", "accès non autorisé système informatique",
+    ],
+    "scan": ["accès frauduleux", "système de traitement automatisé", "394 bis"],
+    "scanning": ["accès frauduleux", "système de traitement automatisé", "394 bis"],
+    "wireshark": ["interception", "écoute réseau", "accès frauduleux", "394 ter"],
     "sniffing": ["interception des communications", "écoute illégale", "accès frauduleux"],
-
-    # Attacks
-    "ddos": ["attaque informatique", "atteinte au fonctionnement", "système de traitement automatisé"],
-    "dos": ["atteinte au fonctionnement du système", "sabotage informatique"],
-    "hacking": ["accès frauduleux", "intrusion informatique", "394 bis"],
-    "hack": ["accès frauduleux", "intrusion", "système informatique"],
-    "exploit": ["accès frauduleux", "vulnérabilité informatique", "atteinte au système"],
-    "bruteforce": ["accès frauduleux", "tentative d'accès non autorisé"],
-    "phishing": ["fraude informatique", "usurpation d'identité", "escroquerie en ligne"],
-    "malware": ["logiciel malveillant", "atteinte aux données", "sabotage informatique"],
-    "ransomware": ["atteinte aux données", "extorsion", "chiffrement non autorisé"],
-    "virus": ["logiciel malveillant", "atteinte au système informatique"],
+    "ddos": ["atteinte au fonctionnement", "système de traitement automatisé", "394 quater"],
+    "dos": ["atteinte au fonctionnement du système", "394 quater"],
+    "hacking": ["accès frauduleux", "394 bis", "394 ter"],
+    "hack": ["accès frauduleux", "394 bis", "système informatique"],
+    "exploit": ["accès frauduleux", "vulnérabilité", "394 bis"],
+    "bruteforce": ["accès frauduleux", "tentative accès non autorisé", "394 bis"],
+    "phishing": ["fraude informatique", "usurpation d'identité", "escroquerie"],
+    "malware": ["logiciel malveillant", "atteinte aux données", "394 quater"],
+    "ransomware": ["atteinte aux données", "extorsion", "394 quater"],
+    "virus": ["logiciel malveillant", "atteinte système informatique", "394 quater"],
     "keylogger": ["logiciel espion", "interception", "données à caractère personnel"],
     "spyware": ["logiciel espion", "surveillance illégale", "données personnelles"],
-    "sql injection": ["accès frauduleux", "altération de données", "base de données"],
-    "injection": ["accès frauduleux", "altération de données"],
+    "sql injection": ["accès frauduleux", "altération de données", "394 ter"],
+    "injection": ["accès frauduleux", "altération de données", "394 ter"],
     "xss": ["atteinte aux données", "fraude informatique"],
-
-    # Privacy / data
-    "tracking": ["traçage", "données à caractère personnel", "vie privée", "loi 18-07"],
+    "tracking": ["données à caractère personnel", "vie privée", "loi 18-07"],
     "cookies": ["données à caractère personnel", "consentement", "loi 18-07"],
-    "données personnelles": ["données à caractère personnel", "loi 18-07", "traitement", "consentement"],
     "vpn": ["réseau privé virtuel", "anonymisation", "communications électroniques"],
-    "tor": ["anonymisation", "accès au réseau", "communications électroniques"],
-
-    # Social engineering / online offences
+    "tor": ["anonymisation", "accès réseau", "communications électroniques"],
     "cyberbullying": ["harcèlement en ligne", "cyberharcèlement", "atteinte à la dignité"],
-    "harcèlement": ["cyberharcèlement", "harcèlement en ligne", "atteinte à la vie privée"],
-    "fake news": ["désinformation", "diffusion de fausses nouvelles", "atteinte à l'ordre public"],
+    "harcèlement": ["cyberharcèlement", "harcèlement", "atteinte vie privée"],
+    "fake news": ["désinformation", "fausses nouvelles", "atteinte ordre public"],
     "deepfake": ["usurpation d'identité", "atteinte à la dignité", "falsification"],
-    "doxxing": ["divulgation de données personnelles", "atteinte à la vie privée", "loi 18-07"],
-
-    # Infrastructure
-    "wifi": ["réseau de communications électroniques", "accès non autorisé", "système informatique"],
-    "wi-fi": ["réseau de communications électroniques", "accès non autorisé"],
+    "doxxing": ["divulgation données personnelles", "atteinte vie privée", "loi 18-07"],
+    "wifi": ["système de traitement automatisé", "réseau communications électroniques", "394 bis"],
+    "wi-fi": ["système de traitement automatisé", "accès non autorisé", "394 bis"],
     "réseau": ["système de traitement automatisé de données", "communications électroniques"],
-    "serveur": ["système de traitement automatisé de données", "infrastructure informatique"],
+    "serveur": ["système de traitement automatisé de données", "infrastructure"],
     "cryptage": ["chiffrement", "signature électronique", "loi 15-04"],
     "chiffrement": ["signature électronique", "loi 15-04", "certification électronique"],
-    "password": ["mot de passe", "accès non autorisé", "données d'authentification"],
-    "mot de passe": ["accès frauduleux", "données d'authentification", "sécurité informatique"],
+    "mot de passe": ["accès frauduleux", "données d'authentification", "394 bis"],
+    "password": ["accès frauduleux", "données d'authentification", "394 bis"],
 }
 
 
 def expand_query(query: str) -> str:
-    """
-    Appends French legal synonyms for any recognised technical terms in the query.
-    The original query is preserved; legal terms are appended to improve retrieval.
-    """
     query_lower = query.lower()
-    extra_terms: list[str] = []
-
+    extra: list[str] = []
     for term, expansions in QUERY_EXPANSION.items():
-        # Match whole word or phrase
-        pattern = r"\b" + re.escape(term) + r"\b"
-        if re.search(pattern, query_lower):
-            extra_terms.extend(expansions)
-
-    if extra_terms:
-        # Deduplicate while preserving order
-        seen = set()
-        unique = [t for t in extra_terms if not (t in seen or seen.add(t))]
+        if re.search(r"\b" + re.escape(term) + r"\b", query_lower):
+            extra.extend(expansions)
+    if extra:
+        seen: set[str] = set()
+        unique = [t for t in extra if not (t in seen or seen.add(t))]
         expanded = query + " | " + " | ".join(unique)
-        logger.debug(f"Query expanded: '{query}' → '{expanded}'")
+        logger.debug(f"Expanded: {expanded}")
         return expanded
-
     return query
 
 
-# ── Module-level initialisation ───────────────────────────────────────────────
+# ── Module-level init ─────────────────────────────────────────────────────────
 
 logger.info("Loading RAG components...")
-_embedding_model = SentenceTransformer(EMBEDDING_MODEL)
-_chroma_client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
-_collection = _chroma_client.get_collection(COLLECTION_NAME)
-_groq_client = Groq(api_key=Config.GROQ_API_KEY)
+
+_embed_model    = SentenceTransformer(EMBEDDING_MODEL)
+_cross_encoder  = CrossEncoder(CROSS_ENCODER_MODEL)
+
+_chroma         = chromadb.PersistentClient(path=CHROMA_DB_DIR)
+_collection     = _chroma.get_collection(COLLECTION_NAME)
+_groq           = Groq(api_key=Config.GROQ_API_KEY)
+
 logger.info("RAG components loaded.")
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Tu es un assistant juridique destiné aux étudiants de l'ESI Alger, spécialisé dans le droit algérien du numérique et de la cybercriminalité.
+SYSTEM_PROMPT = """Tu es un assistant juridique pour étudiants de l'ESI Alger, spécialisé en droit algérien du numérique.
 
-Règles strictes :
-1. Tu réponds UNIQUEMENT en te basant sur les extraits de documents fournis dans le contexte.
-2. Si la réponse n'est pas dans les extraits, dis-le clairement : "Je n'ai pas trouvé d'information sur ce point dans les textes juridiques disponibles."
-3. Ne jamais inventer de lois, d'articles, ou de sanctions qui ne figurent pas dans le contexte.
-4. Cite toujours la source (nom du fichier et numéro d'article si disponible).
-5. Réponds toujours en français, même si la question est posée en anglais ou en arabe.
-6. Sois précis et concis — l'étudiant n'est pas juriste.
-7. Si la question utilise un terme technique (ex: Nmap, DDoS, phishing), relie-le explicitement aux infractions légales correspondantes mentionnées dans les extraits.
-8. Si plusieurs lois s'appliquent, structure ta réponse par loi."""
+Règles STRICTES — respecte-les sans exception :
+1. Réponds en MAXIMUM 4 phrases. Pas plus. Jamais.
+2. Base-toi UNIQUEMENT sur les extraits fournis. N'invente rien.
+3. Si la réponse est absente des extraits, réponds : "Cette question dépasse le contenu des textes juridiques disponibles." — puis arrête-toi.
+4. Cite toujours la loi et l'article (ex : Art. 394 bis du Code pénal).
+5. Va droit au but : commence par la réponse, pas par des généralités.
+6. Si la question mentionne un outil technique (Nmap, DDoS, etc.), dis explicitement quelle infraction il constitue selon les extraits.
+7. Réponds toujours en français."""
 
 
-# ── Retrieval ─────────────────────────────────────────────────────────────────
+# ── Retrieval + reranking ─────────────────────────────────────────────────────
 
-def _retrieve_chunks(question_embedding: list[float]) -> list[dict]:
-    def query_with_filter(where: dict | None, n: int) -> list[dict]:
-        kwargs = dict(
-            query_embeddings=[question_embedding],
-            n_results=min(n, _collection.count()),
-            include=["documents", "metadatas", "distances"],
+def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
+    """
+    1. Embed the expanded query and fetch INITIAL_FETCH candidates from ChromaDB
+       (no priority filter at this stage — cast a wide net).
+    2. Rerank all candidates using a cross-encoder scoring (question, chunk_text).
+    3. Return the top MAX_CONTEXT_CHUNKS by reranker score.
+    """
+    q_emb = _embed_model.encode(expanded).tolist()
+
+    results = _collection.query(
+        query_embeddings=[q_emb],
+        n_results=min(INITIAL_FETCH, _collection.count()),
+        include=["documents", "metadatas", "distances"],
+    )
+
+    candidates = [
+        {
+            "text":     doc,
+            "source":   meta["source"],
+            "page":     meta["page"],
+            "priority": meta["priority"],
+            "distance": dist,
+        }
+        for doc, meta, dist in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
         )
-        if where:
-            kwargs["where"] = where
-        results = _collection.query(**kwargs)
-        return [
+        if dist < DISTANCE_THRESHOLD
+    ]
+
+    if not candidates:
+        # Fallback: loosen threshold, take whatever we have
+        candidates = [
             {"text": doc, "source": meta["source"], "page": meta["page"],
              "priority": meta["priority"], "distance": dist}
             for doc, meta, dist in zip(
@@ -166,26 +173,17 @@ def _retrieve_chunks(question_embedding: list[float]) -> list[dict]:
             )
         ]
 
-    def relevant(chunks):
-        return [c for c in chunks if c["distance"] < DISTANCE_THRESHOLD]
+    # Cross-encoder reranking: score each (original_question, chunk) pair
+    pairs = [(question, c["text"]) for c in candidates]
+    scores = _cross_encoder.predict(pairs)
 
-    # Tier 1: priority 1 only
-    p1 = query_with_filter({"priority": 1}, PRIORITY_1_MIN_RESULTS + 2)
-    p1_good = relevant(p1)
-    if len(p1_good) >= PRIORITY_1_MIN_RESULTS:
-        return sorted(p1_good, key=lambda c: c["distance"])[:MAX_CONTEXT_CHUNKS]
+    for i, score in enumerate(scores):
+        candidates[i]["rerank_score"] = float(score)
 
-    # Tier 2: priority 1 + 2
-    p1p2 = query_with_filter({"priority": {"$in": [1, 2]}}, MAX_CONTEXT_CHUNKS + 2)
-    p1p2_good = relevant(p1p2)
-    if p1p2_good:
-        return sorted(p1p2_good, key=lambda c: c["distance"])[:MAX_CONTEXT_CHUNKS]
+    # Sort by reranker score descending (higher = more relevant)
+    candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
 
-    # Tier 3: no filter
-    return sorted(
-        query_with_filter(None, MAX_CONTEXT_CHUNKS),
-        key=lambda c: c["distance"]
-    )[:MAX_CONTEXT_CHUNKS]
+    return candidates[:MAX_CONTEXT_CHUNKS]
 
 
 # ── Main public function ──────────────────────────────────────────────────────
@@ -194,28 +192,20 @@ def answer_question(question: str) -> str:
     if not question.strip():
         return "Veuillez poser une question."
 
-    # Expand query with legal synonyms for any technical terms
     expanded = expand_query(question)
-
-    # Embed the (possibly expanded) query
-    question_embedding = _embedding_model.encode(expanded).tolist()
-
-    chunks = _retrieve_chunks(question_embedding)
+    chunks   = _retrieve_and_rerank(question, expanded)
 
     if not chunks:
-        return (
-            "Je n'ai pas trouvé d'information pertinente dans les textes juridiques "
-            "disponibles pour répondre à cette question."
-        )
+        return "Je n'ai pas trouvé d'information pertinente dans les textes juridiques disponibles."
 
     context_parts = []
     sources_seen: list[str] = []
 
-    for i, chunk in enumerate(chunks, start=1):
-        label = f"{chunk['source']} (page {chunk['page']})"
+    for i, c in enumerate(chunks, 1):
+        label = f"{c['source']} (page {c['page']})"
         context_parts.append(
-            f"--- Extrait {i} | Source : {label} | "
-            f"Pertinence : {(1 - chunk['distance']) * 100:.0f}% ---\n{chunk['text']}"
+            f"--- Extrait {i} | {label} | "
+            f"Score : {c.get('rerank_score', 0):.2f} ---\n{c['text']}"
         )
         if label not in sources_seen:
             sources_seen.append(label)
@@ -224,27 +214,25 @@ def answer_question(question: str) -> str:
 
     user_message = (
         f"Contexte juridique :\n\n{context_block}\n\n"
-        f"Question de l'étudiant : {question}\n\n"
-        "Réponds en te basant uniquement sur le contexte. "
-        "Cite les articles et lois pertinents. "
-        "Si la question mentionne un outil technique (Nmap, etc.), "
-        "explique quelle infraction légale cela pourrait constituer selon les extraits."
+        f"Question : {question}\n\n"
+        "Réponds en 4 phrases maximum. Cite la loi et l'article. "
+        "Si un outil technique est mentionné, dis quelle infraction il constitue."
     )
 
     try:
-        completion = _groq_client.chat.completions.create(
+        resp = _groq.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
+                {"role": "user",   "content": user_message},
             ],
-            temperature=0.1,
-            max_tokens=1024,
+            temperature=0.05,
+            max_tokens=450,
         )
-        answer = completion.choices[0].message.content.strip()
+        answer = resp.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f"Groq API error: {e}")
-        raise RuntimeError(f"Erreur lors de la génération de la réponse : {e}") from e
+        logger.error(f"Groq error: {e}")
+        raise RuntimeError(f"Erreur lors de la génération : {e}") from e
 
-    sources_text = "\n\n📚 **Sources consultées :**\n" + "\n".join(f"• {s}" for s in sources_seen)
+    sources_text = "\n\n📚 **Sources :**\n" + "\n".join(f"• {s}" for s in sources_seen)
     return answer + sources_text
