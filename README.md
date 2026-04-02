@@ -7,9 +7,9 @@ A Discord bot built on top of the [Shellmates](https://github.com/sara-arz/shell
 ## ✨ Features
 
 ### ⚖️ DCIT Cyber-Law Assistant *(new)*
-An AI assistant that answers questions about Algerian cyber law and digital citizenship, grounded in official legal texts via RAG (Retrieval-Augmented Generation). It never invents laws — it only answers from the documents.
+An AI assistant that answers questions about Algerian cyber law and digital citizenship, grounded in official legal texts via RAG. It never invents laws — it only answers from the documents.
 
-- `/ask-law <question>` — Ask anything about Algerian cyber law in French
+- `/ask-law <question>` — Ask anything about Algerian cyber law in French (or English)
 - `/law-help` — Show what the bot does and which laws it knows
 
 ### 🛡️ Moderation
@@ -33,13 +33,15 @@ knowledge_base/ (PDFs)
         │
         ▼
   ingest.py ──── pypdf (text extraction + boilerplate cleaning)
-              ── article-aware chunking
+              ── article-aware chunking (splits on Art. X boundaries)
               ── paraphrase-multilingual-MiniLM-L12-v2 (embeddings)
               ── ChromaDB (vector DB with priority metadata)
                        │
                        ▼
-            rag_query.py ──── query expansion (Nmap → "accès frauduleux", etc.)
-                           ── tiered retrieval: P1 → P2 → P3 fallback by distance
+            rag_query.py ──── query expansion (Nmap → "394 bis accès frauduleux", etc.)
+                           ── cosine retrieval: top 40 candidates (wide net)
+                           ── cross-encoder reranking: ms-marco-MiniLM-L-6-v2
+                           ── priority boost: P1 docs score +0.5
                            ── Groq API / llama-3.3-70b-versatile
                                       │
                                       ▼
@@ -47,9 +49,11 @@ knowledge_base/ (PDFs)
                                              ── /law-help
 ```
 
-**Priority system:** documents are tagged 1–3 at ingestion. On every query, Priority 1 sources (core cyber laws) are searched first using cosine distance scores. If similarity is too low, the search broadens to P2, then P3.
+**Two-stage retrieval:** cosine similarity finds 40 candidate chunks quickly; a cross-encoder then re-scores each (question, chunk) pair semantically. This separates word overlap from actual meaning — ensuring `Nmap` maps to `Art. 394 bis` even though the words don't match.
 
-**Query expansion:** technical terms like `Nmap`, `DDoS`, `phishing`, `ransomware` are automatically mapped to their French legal equivalents (`accès frauduleux`, `atteinte au système`, etc.) before embedding, bridging the gap between student vocabulary and legal text.
+**Query expansion:** technical terms (`Nmap`, `DDoS`, `phishing`, etc.) are mapped to French legal equivalents before embedding. Covers both French and English input.
+
+**Priority boost:** Priority 1 documents (core cyber laws) receive a fixed score bonus in the reranker, ensuring they beat background documents when relevance is otherwise similar.
 
 ---
 
@@ -58,17 +62,17 @@ knowledge_base/ (PDFs)
 | Document | Description | Priority | Language |
 |----------|-------------|----------|----------|
 | `DZ_FR_Cybercrime Law_2009.pdf` | Loi 09-04 — cybercriminalité | 1 | FR |
-| `2016_Algeria_fr_Code Penal.pdf` | Code pénal — Art. 394 bis–nonies (TIC) | 1 | FR |
+| `2016_Algeria_fr_Code Penal.pdf` | Code pénal complet — Art. 394 bis–nonies (TIC) | 1 | FR |
 | `2018_Algeria_fr_Loi n_ 18-07...pdf` | Loi 18-07 — protection des données | 1 | FR |
-| `Loi n° 18-07...pdf` | Loi 18-07 — copie de cours | 1 | FR |
+| `Loi n° 18-07...pdf` | Loi 18-07 — copie cours ESI | 1 | FR |
 | `Law 20-06 Algeria.pdf` | Modifications code pénal 2020 | 2 | FR |
 | `2020_Algeria_fr_Décret présidentiel n_ 20-05...pdf` | Dispositif national SSI | 2 | FR |
 | `Loi n∞ 15-04...pdf` | Signature et certification électroniques | 2 | FR |
 | `Penal Procedure Code 2021 Update.pdf` | Pôle pénal TIC 2021 | 2 | FR |
-| `2010_en_League of Arab States Convention...pdf` | Convention arabe cybercriminalité | 2 | EN |
+| `Arab_Convention_Cybercrime_2010_FR.pdf.pdf` | Convention arabe cybercriminalité (FR) | 2 | FR |
 | `Loi organique n° 12-05...pdf` | Loi sur l'information 2012 | 3 | FR |
 
-> **Note:** The full Penal Code is 362 pages. Only pages 108–140 (TIC articles) are ingested to avoid noise from unrelated criminal law.
+> The full Penal Code (362 pages) is ingested. The cross-encoder handles relevance precision — only TIC-relevant articles make it into the final context.
 
 ---
 
@@ -82,22 +86,23 @@ cd DCIT-project
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+pip install sentence-transformers --upgrade   # ensures CrossEncoder is available
 ```
 
 ### 2. Configure environment variables
 
 ```bash
 cp .env.example .env
-# Edit .env and fill in DISCORD_TOKEN and GROQ_API_KEY
+# Fill in DISCORD_TOKEN and GROQ_API_KEY
 ```
 
 Get a free Groq API key at [console.groq.com](https://console.groq.com).
 
 ### 3. Add PDFs to `knowledge_base/`
 
-Place all legal text PDFs in `knowledge_base/`. All documents should be in French. For non-French PDFs, translate using [DeepL](https://www.deepl.com) before adding.
+Place all legal text PDFs in `knowledge_base/`. Documents should be in French where possible — translate non-French PDFs using [DeepL](https://www.deepl.com) before adding.
 
-Update `document_priorities.py` if you add new files — filenames must match exactly.
+If you add a new file, add its exact filename to `document_priorities.py`.
 
 ### 4. Build the vector database
 
@@ -105,7 +110,7 @@ Update `document_priorities.py` if you add new files — filenames must match ex
 python ingest.py
 ```
 
-This runs once and creates `chroma_db/`. Re-run whenever you add or update PDFs.
+This runs once and creates `chroma_db/`. Re-run whenever you add or update PDFs. The cross-encoder model (~80MB) is downloaded automatically on first bot startup.
 
 ### 5. Run the bot
 
@@ -113,9 +118,9 @@ This runs once and creates `chroma_db/`. Re-run whenever you add or update PDFs.
 python main.py
 ```
 
-Slash commands are synced automatically on startup. The first run may take ~30 seconds longer while the embedding model loads.
+Slash commands sync automatically on startup. First run takes ~30–60 seconds while models load.
 
-> **Note:** The events, quiz, and reminder features require a PostgreSQL database (`DB_URL` in `.env`). The RAG assistant works without it.
+> **Note:** Events, quiz, and reminder features require a PostgreSQL database (`DB_URL` in `.env`). The RAG assistant works without it.
 
 ---
 
@@ -125,7 +130,7 @@ Slash commands are synced automatically on startup. The first run may take ~30 s
 
 | Command | Description |
 |---------|-------------|
-| `/ask-law <question>` | Ask about Algerian cyber law (in French) |
+| `/ask-law <question>` | Ask about Algerian cyber law (French or English) |
 | `/law-help` | What the bot knows and how to use it |
 
 **Example queries:**
@@ -133,8 +138,8 @@ Slash commands are synced automatically on startup. The first run may take ~30 s
 /ask-law Quelles sont les sanctions pour accès frauduleux à un système informatique ?
 /ask-law Est-il légal d'effectuer un scan Nmap sur un réseau Wi-Fi public ?
 /ask-law Que dit la loi 18-07 sur la collecte de données personnelles ?
-/ask-law Quels sont les droits d'une personne dont les données ont été volées ?
-/ask-law Qu'est-ce que la cybercriminalité selon la loi algérienne ?
+/ask-law Am I allowed to perform an Nmap scan on a public wifi I don't own?
+/ask-law What are the penalties for unauthorized access to a computer system?
 ```
 
 ### 👥 Community Commands
@@ -162,7 +167,7 @@ Slash commands are synced automatically on startup. The first run may take ~30 s
 DCIT-project/
 ├── bot/
 │   ├── cogs/
-│   │   ├── cyber_law_ai.py       ← DCIT AI assistant (new)
+│   │   ├── cyber_law_ai.py       ← DCIT AI assistant
 │   │   ├── cyberfacts_commands.py
 │   │   ├── events_commands.py
 │   │   ├── banned_words.py
@@ -171,13 +176,13 @@ DCIT-project/
 │   └── bot.py
 ├── database/
 │   ├── Repositories/
-│   └── connection.py
+│   └── connection.py             ← patched for lazy DB connection
 ├── knowledge_base/               ← PDFs go here (gitignored)
-├── chroma_db/                    ← Auto-generated vector DB (gitignored)
-├── ingest.py                     ← Run once to build the DB
-├── rag_query.py                  ← RAG engine with query expansion
-├── document_priorities.py        ← PDF priority tier mapping
-├── config.py
+├── chroma_db/                    ← auto-generated vector DB (gitignored)
+├── ingest.py                     ← run once to build the DB
+├── rag_query.py                  ← RAG engine: expansion + cosine + reranker
+├── document_priorities.py        ← PDF priority mapping (exact filenames)
+├── config.py                     ← env vars including GROQ_API_KEY
 ├── main.py
 └── .env.example
 ```
@@ -187,15 +192,15 @@ DCIT-project/
 ## ⚠️ Limitations
 
 - Answers are **indicative** — not a substitute for professional legal advice.
-- The bot only answers from documents in its knowledge base. It will say so clearly if it cannot find an answer.
+- The bot only answers from its knowledge base. It says so clearly when it cannot find an answer.
 - Events, quiz, and reminder features require a PostgreSQL connection.
-- Non-French PDFs (English/Arabic) produce lower-quality retrieval. Translate to French before ingesting for best results.
+- Non-French PDFs produce lower-quality retrieval. Translate to French before ingesting.
 
 ---
 
 ## 🙏 Acknowledgements
 
 - Base bot: [sara-arz/shellmates-discord-bot](https://github.com/sara-arz/shellmates-discord-bot) — Shellmates Club, ESI Alger
-- Legal texts: Journal Officiel de la République Algérienne, [CYRILLA Database](https://cyrilla.org), [UNIDIR Cyber Policy Portal](https://database.cyberpolicyportal.org)
+- Legal texts: Journal Officiel de la République Algérienne, [CYRILLA](https://cyrilla.org), [UNIDIR](https://database.cyberpolicyportal.org)
 - AI inference: [Groq](https://groq.com) — Meta Llama 3.3 70B Versatile
-- Embeddings: [sentence-transformers](https://www.sbert.net) — `paraphrase-multilingual-MiniLM-L12-v2`
+- Embeddings + reranking: [sentence-transformers](https://www.sbert.net) — `paraphrase-multilingual-MiniLM-L12-v2` + `ms-marco-MiniLM-L-6-v2`
