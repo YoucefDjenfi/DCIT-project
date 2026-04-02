@@ -1,7 +1,8 @@
 """
-rag_query.py  v5
+rag_query.py  v6
 ────────────────
-Forced inclusion of Penal Code for security-related queries.
+For security queries: force at least 2 Penal Code chunks into the final context,
+bypassing cross-encoder scores if necessary.
 """
 
 import sys
@@ -28,6 +29,7 @@ GROQ_MODEL          = "llama-3.3-70b-versatile"
 
 INITIAL_FETCH       = 30          # general cosine candidates
 PENAL_CODE_FETCH    = 10          # forced Penal Code candidates (if query is security-related)
+FORCED_PENAL_COUNT  = 2           # number of Penal Code chunks to force into final context
 MAX_CONTEXT_CHUNKS  = 4
 
 PRIORITY_BOOST = {1: 2.0, 2: 0.5, 3: 0.0}
@@ -41,7 +43,7 @@ SECURITY_KEYWORDS = [
     "penalties", "criminal", "crime", "accès frauduleux", "394 bis", "intrusion", "cybercrime"
 ]
 
-# ── Query expansion (same as before) ────────────────────────────────────────────
+# ── Query expansion ────────────────────────────────────────────────────────────
 
 QUERY_EXPANSION: dict[str, list[str]] = {
     "nmap": [
@@ -120,7 +122,6 @@ def expand_query(query: str) -> str:
 
 
 def is_security_query(query: str) -> bool:
-    """Return True if query contains any security keyword (case-insensitive)."""
     q_lower = query.lower()
     return any(kw in q_lower for kw in SECURITY_KEYWORDS)
 
@@ -135,8 +136,6 @@ _collection    = _chroma.get_collection(COLLECTION_NAME)
 _groq          = Groq(api_key=Config.GROQ_API_KEY)
 logger.info("RAG components loaded.")
 
-# ── System prompt (same) ─────────────────────────────────────────────────────
-
 SYSTEM_PROMPT = """Tu es un assistant juridique pour étudiants de l'ESI Alger, spécialisé en droit algérien du numérique.
 
 RÈGLES ABSOLUES :
@@ -148,7 +147,6 @@ RÈGLES ABSOLUES :
 6. Si la réponse est absente des extraits : "Cette question n'est pas couverte par les textes disponibles." — puis stop.
 7. Réponds en français même si la question est en anglais ou en arabe."""
 
-# ── Retrieval + reranking with forced Penal Code inclusion ────────────────────
 
 def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
     # 1. General cosine search
@@ -159,74 +157,95 @@ def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
         include=["documents", "metadatas", "distances"],
     )
 
-    candidates = [
-        {
+    candidates = []
+    penal_chunks = []  # store separately for forced inclusion
+
+    for doc, meta, dist in zip(
+        general_results["documents"][0],
+        general_results["metadatas"][0],
+        general_results["distances"][0],
+    ):
+        c = {
             "text":     doc,
             "source":   meta["source"],
             "page":     meta["page"],
             "priority": meta["priority"],
             "distance": dist,
         }
-        for doc, meta, dist in zip(
-            general_results["documents"][0],
-            general_results["metadatas"][0],
-            general_results["distances"][0],
-        )
-    ]
+        candidates.append(c)
+        if meta["source"] == "2016_Algeria_fr_Code Penal.pdf":
+            penal_chunks.append(c)
 
-    # 2. If security-related query, force-include top Penal Code chunks
+    # 2. If security query, fetch additional Penal Code chunks (even if not in top general)
     if is_security_query(question):
-        # Search only the Penal Code PDF (metadata filter)
         penal_results = _collection.query(
             query_embeddings=[q_emb],
             n_results=min(PENAL_CODE_FETCH, _collection.count()),
             where={"source": "2016_Algeria_fr_Code Penal.pdf"},
             include=["documents", "metadatas", "distances"],
         )
-        penal_chunks = [
-            {
-                "text":     doc,
-                "source":   meta["source"],
-                "page":     meta["page"],
-                "priority": meta["priority"],
-                "distance": dist,
-            }
-            for doc, meta, dist in zip(
-                penal_results["documents"][0],
-                penal_results["metadatas"][0],
-                penal_results["distances"][0],
-            )
-        ]
-        # Merge, avoiding duplicates (by text content – simple heuristic)
         existing_texts = {c["text"] for c in candidates}
-        for pc in penal_chunks:
-            if pc["text"] not in existing_texts:
+        for doc, meta, dist in zip(
+            penal_results["documents"][0],
+            penal_results["metadatas"][0],
+            penal_results["distances"][0],
+        ):
+            if doc not in existing_texts:
+                pc = {
+                    "text":     doc,
+                    "source":   meta["source"],
+                    "page":     meta["page"],
+                    "priority": meta["priority"],
+                    "distance": dist,
+                }
                 candidates.append(pc)
-                existing_texts.add(pc["text"])
-        logger.info(f"[force] Added {len(penal_chunks)} Penal Code chunks to candidates (total now {len(candidates)})")
+                penal_chunks.append(pc)
+                existing_texts.add(doc)
+        logger.info(f"[force] Added {len(penal_results['documents'][0])} Penal Code chunks (total candidates {len(candidates)})")
 
-    # 3. Cross-encoder scoring
+    # 3. Cross-encoder reranking
     pairs = [(question, c["text"]) for c in candidates]
     scores = _cross_encoder.predict(pairs)
-
     for i, c in enumerate(candidates):
         boost = PRIORITY_BOOST.get(c["priority"], 0.0)
         c["rerank_score"] = float(scores[i]) + boost
 
+    # Sort by rerank score
     candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
 
+    # 4. FORCED INCLUSION: For security queries, ensure at least FORCED_PENAL_COUNT Penal Code chunks
+    #    are in the final top MAX_CONTEXT_CHUNKS. If not, replace the lowest-ranked non-Penal Code chunks.
+    if is_security_query(question):
+        # Collect top MAX_CONTEXT_CHUNKS candidates
+        final = candidates[:MAX_CONTEXT_CHUNKS]
+        # Count how many Penal Code chunks are already in final
+        penal_in_final = [c for c in final if c["source"] == "2016_Algeria_fr_Code Penal.pdf"]
+        need = FORCED_PENAL_COUNT - len(penal_in_final)
+        if need > 0:
+            # Get the best Penal Code chunks not already in final, sorted by rerank score
+            available_penal = [c for c in penal_chunks if c not in final]
+            available_penal.sort(key=lambda c: c["rerank_score"], reverse=True)
+            # Replace the lowest-scoring non-Penal Code chunks in final
+            for i in range(min(need, len(available_penal))):
+                # Find lowest-scoring non-Penal Code chunk in final
+                for j in range(len(final)-1, -1, -1):
+                    if final[j]["source"] != "2016_Algeria_fr_Code Penal.pdf":
+                        final[j] = available_penal[i]
+                        break
+            logger.info(f"[force] Forced {need} Penal Code chunks into final context")
+        candidates = final
+    else:
+        candidates = candidates[:MAX_CONTEXT_CHUNKS]
+
     # Debug log
-    logger.info("[rerank] Top 5 chunks after reranking:")
-    for i, c in enumerate(candidates[:5]):
+    logger.info("[rerank] Top chunks after forcing:")
+    for i, c in enumerate(candidates):
         logger.info(
             f"  {i+1}. [{c['source'][:40]}] p{c['page']} "
             f"| cosine={c['distance']:.3f} | rerank={c['rerank_score']:.3f} | P{c['priority']}"
         )
+    return candidates
 
-    return candidates[:MAX_CONTEXT_CHUNKS]
-
-
-# ── Main public function ──────────────────────────────────────────────────────
 
 def answer_question(question: str) -> str:
     if not question.strip():
