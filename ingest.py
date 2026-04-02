@@ -1,12 +1,10 @@
 """
-ingest.py  v3
+ingest.py  v4
 ─────────────
-Changes from v2:
-- Penal Code page range removed. Instead, pages are filtered by content:
-  only pages that contain TIC-related keywords are ingested. This is more
-  reliable than hardcoded page indices which vary by PDF copy.
-- SKIP_FILES now includes the translated Arab Convention duplicate check
-- Priority mapping updated for Arab_Convention_Cybercrime_2010_FR.pdf.pdf
+Key change: Penal Code ingested in FULL (no page range, no keyword filter).
+Page index 118 (PDF page 119) contains art. 394 bis — confirmed by user's
+diagnostic script. Ingesting the full PDF ensures we never miss TIC articles
+regardless of which PDF version is used. The cross-encoder handles precision.
 """
 
 import re
@@ -20,33 +18,13 @@ import chromadb
 sys.path.insert(0, str(Path(__file__).parent))
 from document_priorities import get_priority, should_skip
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-
 KNOWLEDGE_BASE_DIR = "./knowledge_base"
 CHROMA_DB_DIR      = "./chroma_db"
 COLLECTION_NAME    = "cyber_law"
 EMBEDDING_MODEL    = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-
 CHUNK_SIZE         = 800
 CHUNK_OVERLAP      = 150
 
-# For the Penal Code we do keyword-based page filtering instead of
-# hardcoded page numbers (which differ across PDF versions).
-PENAL_CODE_FILENAME = "2016_Algeria_fr_Code Penal.pdf"
-
-# A page is kept from the Penal Code only if it contains at least one of
-# these strings. This captures TIC articles + surrounding context.
-PENAL_CODE_KEYWORDS = [
-    "394 bis", "394 ter", "394 quater", "394 quinquies",
-    "394 sexies", "394 septies", "394 octies", "394 nonies",
-    "système de traitement automatisé",
-    "accès frauduleux",
-    "données informatiques",
-    "cybercriminalité",
-    "atteinte aux systèmes",
-]
-
-# Boilerplate to strip from Journal Officiel PDFs
 BOILERPLATE_PATTERNS = [
     re.compile(r"JOURNAL\s+OFFICIEL\s+DE\s+LA\s+REPUBLIQUE\s+ALGERIENNE[^\n]*", re.IGNORECASE),
     re.compile(r"Joumada\s+El\s+(?:Oula|Ethania)[^\n]*\d{4}", re.IGNORECASE),
@@ -64,8 +42,6 @@ ARTICLE_PATTERN = re.compile(
 )
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
 def clean_text(text: str) -> str:
     for p in BOILERPLATE_PATTERNS:
         text = p.sub(" ", text)
@@ -74,31 +50,23 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def page_is_relevant_for_penal_code(text: str) -> bool:
-    text_lower = text.lower()
-    return any(kw.lower() in text_lower for kw in PENAL_CODE_KEYWORDS)
-
-
-def extract_pages(pdf_path: str, keyword_filter: bool = False) -> list[tuple[str, int]]:
+def extract_pages(pdf_path: str) -> list[tuple[str, int]]:
     pages = []
     try:
         reader = PdfReader(pdf_path)
         for i, page in enumerate(reader.pages):
-            raw = page.extract_text() or ""
+            raw     = page.extract_text() or ""
             cleaned = clean_text(raw)
-            if not cleaned:
-                continue
-            if keyword_filter and not page_is_relevant_for_penal_code(cleaned):
-                continue
-            pages.append((cleaned, i + 1))
+            if cleaned:
+                pages.append((cleaned, i + 1))
     except Exception as e:
         print(f"  ⚠ Could not read {pdf_path}: {e}")
     return pages
 
 
 def chunk_text(text: str, source: str, page: int, priority: int) -> list[dict]:
-    chunks = []
-    parts = ARTICLE_PATTERN.split(text)
+    chunks   = []
+    parts    = ARTICLE_PATTERN.split(text)
     segments = []
     i = 0
     while i < len(parts):
@@ -129,8 +97,6 @@ def chunk_text(text: str, source: str, page: int, priority: int) -> list[dict]:
     return chunks
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 def build_database():
     pdf_dir = Path(KNOWLEDGE_BASE_DIR)
     if not pdf_dir.exists():
@@ -152,12 +118,9 @@ def build_database():
             continue
 
         priority = get_priority(filename)
-        is_penal_code = (filename == PENAL_CODE_FILENAME)
+        print(f"  [P{priority}] {filename}")
 
-        print(f"  [P{priority}] {filename}" + (" (keyword-filtered)" if is_penal_code else ""))
-
-        pages = extract_pages(str(pdf_path), keyword_filter=is_penal_code)
-
+        pages = extract_pages(str(pdf_path))
         if not pages:
             print(f"       ⚠ No extractable text. Skipping.")
             skipped.append(filename)
@@ -167,17 +130,17 @@ def build_database():
         for page_text, page_num in pages:
             file_chunks.extend(chunk_text(page_text, filename, page_num, priority))
 
-        print(f"       → {len(pages)} pages kept, {len(file_chunks)} chunks")
+        print(f"       → {len(pages)} pages, {len(file_chunks)} chunks")
         all_chunks.extend(file_chunks)
 
     print(f"\nSkipped: {skipped}")
     print(f"Total chunks: {len(all_chunks)}\n")
 
-    print(f"Loading embedding model: {EMBEDDING_MODEL}")
+    print(f"Loading embedding model...")
     model = SentenceTransformer(EMBEDDING_MODEL)
 
     print("Embedding...")
-    texts = [c["text"] for c in all_chunks]
+    texts      = [c["text"] for c in all_chunks]
     embeddings = model.encode(texts, show_progress_bar=True, batch_size=32)
 
     print("\nStoring in ChromaDB...")
@@ -198,10 +161,10 @@ def build_database():
         batch     = all_chunks[start: start + BATCH]
         batch_emb = embeddings[start: start + BATCH]
         collection.add(
-            ids=[str(start + i) for i in range(len(batch))],
+            ids       =[str(start + i) for i in range(len(batch))],
             embeddings=[e.tolist() for e in batch_emb],
-            documents=[c["text"] for c in batch],
-            metadatas=[
+            documents =[c["text"] for c in batch],
+            metadatas =[
                 {"source": c["source"], "page": c["page"], "priority": c["priority"]}
                 for c in batch
             ],
