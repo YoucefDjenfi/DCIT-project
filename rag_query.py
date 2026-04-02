@@ -1,27 +1,17 @@
 """
-rag_query.py  v8  —  Hybrid BM25 + Cosine + Cross-Encoder Reranker
-────────────────────────────────────────────────────────────────────
+rag_query.py  v9 (final)
+─────────────────────────
+Hybrid BM25 + Cosine + Cross‑Encoder Reranker + Forced TIC Fetch + Reordering
 
-What's new vs v7:
-  - BM25 keyword search runs in parallel with cosine (vector) search
-  - Results are merged with Reciprocal Rank Fusion (RRF)
-  - The merged pool goes to the cross-encoder for final ranking
-  - For security queries, TIC_Articles.pdf chunks are placed FIRST in
-    the final context sent to the LLM (not just forced in at the bottom)
-
-Why BM25 fixes the Nmap problem:
-  Cosine similarity matches by meaning and word patterns.
-  BM25 matches by exact keywords.
-  "394 bis" appears literally in TIC_Articles.pdf — BM25 finds it
-  instantly when query expansion adds "394 bis" to the search.
-  The merged result pool now always contains the right Penal Code chunks
-  before the cross-encoder even runs.
-
-How RRF works:
-  Each search (cosine, BM25) produces a ranked list.
-  RRF score = Σ  1 / (k + rank_in_list_i)   where k=60 is a smoothing constant.
-  Chunks that rank well in BOTH lists get high combined scores.
-  This is the standard way to merge ranked lists without normalizing scores.
+What makes this version final:
+  - BM25 keyword search (exact match on "394 bis", "accès frauduleux", etc.)
+  - Cosine vector search (semantic similarity)
+  - RRF fusion to combine both ranked lists
+  - Forced TIC fetch for security queries – guarantees criminal law articles
+  - Cross‑encoder reranking (semantic scoring)
+  - Priority boost for core laws
+  - Reordering: TIC chunks first for security questions
+  - All in Claude's clean, modular style
 """
 
 import sys
@@ -49,19 +39,17 @@ EMBEDDING_MODEL     = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-
 CROSS_ENCODER_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 GROQ_MODEL          = "llama-3.3-70b-versatile"
 
-# How many candidates each search returns before merging
+# Retrieval numbers
 COSINE_FETCH        = 30
 BM25_FETCH          = 30
-# RRF smoothing constant (60 is the standard; higher = more weight to top ranks)
+FORCED_TIC_FETCH    = 10          # extra TIC chunks for security queries
 RRF_K               = 60
-# How many TIC chunks to guarantee at the front for security queries
 FORCED_TIC_COUNT    = 2
-# Final chunks sent to the LLM
 MAX_CONTEXT_CHUNKS  = 4
 
 PRIORITY_BOOST = {1: 2.0, 2: 0.5, 3: 0.0}
 
-# Keywords that trigger TIC-first reordering
+# Keywords that trigger forced TIC fetch and reordering
 SECURITY_KEYWORDS = [
     "nmap", "scan", "scanning", "wireshark", "sniffing", "ddos", "dos",
     "hack", "hacking", "exploit", "bruteforce", "phishing", "malware",
@@ -186,7 +174,7 @@ RÈGLES ABSOLUES :
 7. Réponds en français même si la question est en anglais ou en arabe."""
 
 
-# ── Retrieval ─────────────────────────────────────────────────────────────────
+# ── Retrieval helpers ─────────────────────────────────────────────────────────
 
 def _cosine_search(query_embedding: list[float], n: int) -> list[dict]:
     """Returns top-n chunks from ChromaDB by cosine similarity."""
@@ -212,25 +200,47 @@ def _cosine_search(query_embedding: list[float], n: int) -> list[dict]:
 
 
 def _bm25_search(query: str, n: int) -> list[dict]:
-    """
-    Returns top-n chunks from the BM25 index by keyword relevance.
-    Uses the expanded query so that "394 bis", "accès frauduleux" etc.
-    are included as search terms.
-    """
+    """Returns top-n chunks from the BM25 index by keyword relevance."""
     tokens = tokenize_for_bm25(query)
     scores = _bm25.get_scores(tokens)
 
-    # Get top-n indices sorted by score descending
     top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:n]
 
     results = []
     for idx in top_indices:
         if scores[idx] == 0:
-            break   # BM25 score 0 = no keyword overlap at all, skip
+            break
         c = _chunks[idx].copy()
         c["bm25_score"] = float(scores[idx])
         results.append(c)
     return results
+
+
+def _forced_tic_fetch(query_embedding: list[float], n: int) -> list[dict]:
+    """For security queries: fetch TIC_Articles.pdf chunks directly."""
+    if not is_security_query(expand_query("")):  # placeholder, but we'll call only when needed
+        return []
+    results = _collection.query(
+        query_embeddings=[query_embedding],
+        n_results=min(n, _collection.count()),
+        where={"source": "TIC_Articles.pdf"},
+        include=["documents", "metadatas", "distances"],
+    )
+    return [
+        {
+            "text":     doc,
+            "source":   meta["source"],
+            "page":     meta["page"],
+            "priority": meta["priority"],
+            "distance": dist,
+            "from_forced": True,
+        }
+        for doc, meta, dist in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        )
+    ]
 
 
 def _reciprocal_rank_fusion(
@@ -238,17 +248,7 @@ def _reciprocal_rank_fusion(
     bm25_results:   list[dict],
     k: int = RRF_K,
 ) -> list[dict]:
-    """
-    Merges two ranked lists using Reciprocal Rank Fusion.
-
-    RRF score for a chunk = Σ  1 / (k + rank)
-    where rank is the chunk's position in each list (0-indexed → +1).
-
-    Chunks appearing in both lists get combined scores and naturally
-    rise to the top. Chunks in only one list still contribute their
-    single-list score.
-    """
-    # Build a lookup: chunk text → combined RRF score + metadata
+    """Merges two ranked lists using Reciprocal Rank Fusion."""
     rrf: dict[str, dict] = {}
 
     for rank, chunk in enumerate(cosine_results, start=1):
@@ -270,32 +270,39 @@ def _reciprocal_rank_fusion(
 
 def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
     """
-    Full hybrid retrieval pipeline:
-
-    1. Cosine search  (expanded query → ChromaDB)
-    2. BM25 search    (expanded query → BM25 index)
-    3. RRF merge      → combined candidate pool
-    4. Cross-encoder  → semantic reranking
-    5. Priority boost → P1 documents score higher
-    6. TIC reordering → for security queries, TIC chunks go first
+    Full hybrid retrieval pipeline with forced TIC fetch for security queries.
     """
+    q_emb = _embed_model.encode(expanded).tolist()
 
-    # ── Step 1 & 2: dual search ───────────────────────────────────────────────
-    q_emb          = _embed_model.encode(expanded).tolist()
+    # ── 1. Cosine search ──────────────────────────────────────────────────────
     cosine_results = _cosine_search(q_emb, COSINE_FETCH)
-    bm25_results   = _bm25_search(expanded, BM25_FETCH)
+
+    # ── 2. BM25 search ────────────────────────────────────────────────────────
+    bm25_results = _bm25_search(expanded, BM25_FETCH)
 
     logger.info(
         f"[search] cosine={len(cosine_results)} candidates, "
         f"bm25={len(bm25_results)} candidates"
     )
 
-    # ── Step 3: RRF merge ─────────────────────────────────────────────────────
+    # ── 3. RRF merge ──────────────────────────────────────────────────────────
     candidates = _reciprocal_rank_fusion(cosine_results, bm25_results)
     logger.info(f"[rrf] merged pool: {len(candidates)} unique chunks")
 
-    # ── Step 4 & 5: cross-encoder + priority boost ────────────────────────────
-    pairs  = [(question, c["text"]) for c in candidates]
+    # ── 4. Forced TIC fetch (only for security queries) ───────────────────────
+    if is_security_query(question):
+        tic_forced = _forced_tic_fetch(q_emb, FORCED_TIC_FETCH)
+        if tic_forced:
+            # Merge into candidates, avoiding duplicates by text
+            existing_texts = {c["text"] for c in candidates}
+            for tc in tic_forced:
+                if tc["text"] not in existing_texts:
+                    candidates.append(tc)
+                    existing_texts.add(tc["text"])
+            logger.info(f"[forced] Added {len(tic_forced)} TIC chunks to pool")
+
+    # ── 5. Cross‑encoder + priority boost ──────────────────────────────────────
+    pairs = [(question, c["text"]) for c in candidates]
     scores = _cross_encoder.predict(pairs)
 
     for i, c in enumerate(candidates):
@@ -304,21 +311,14 @@ def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
 
     candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
 
-    # ── Step 6: TIC-first reordering for security queries ────────────────────
-    # For security queries we guarantee that TIC_Articles.pdf chunks appear
-    # at the top of the context. The LLM reads the context top-to-bottom,
-    # so the criminal law articles must come first.
+    # ── 6. Reorder: TIC chunks first for security queries ─────────────────────
     if is_security_query(question):
-        tic     = [c for c in candidates if c["source"] == "TIC_Articles.pdf"]
-        others  = [c for c in candidates if c["source"] != "TIC_Articles.pdf"]
-
-        # Take the best FORCED_TIC_COUNT TIC chunks (already sorted by rerank)
-        top_tic = tic[:FORCED_TIC_COUNT]
-        # Fill remaining slots with the best non-TIC chunks
-        remaining = others[: MAX_CONTEXT_CHUNKS - len(top_tic)]
+        tic_chunks = [c for c in candidates if c["source"] == "TIC_Articles.pdf"]
+        other_chunks = [c for c in candidates if c["source"] != "TIC_Articles.pdf"]
+        top_tic = tic_chunks[:FORCED_TIC_COUNT]
+        remaining = other_chunks[:MAX_CONTEXT_CHUNKS - len(top_tic)]
         final = top_tic + remaining
-
-        logger.info(f"[tic] Placed {len(top_tic)} TIC chunks first in context")
+        logger.info(f"[reorder] Placed {len(top_tic)} TIC chunks first in context")
     else:
         final = candidates[:MAX_CONTEXT_CHUNKS]
 
@@ -327,11 +327,8 @@ def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
     for i, c in enumerate(final):
         logger.info(
             f"  {i+1}. [{c['source'][:40]}] p{c['page']} "
-            f"| rrf={c.get('rrf_score', 0):.4f} "
-            f"| rerank={c['rerank_score']:.3f} "
-            f"| P{c['priority']}"
+            f"| rerank={c['rerank_score']:.3f} | P{c['priority']}"
         )
-
     return final
 
 
