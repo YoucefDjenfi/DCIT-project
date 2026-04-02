@@ -1,8 +1,5 @@
 """
-rag_query.py  v11 (final – aggressive filter for security queries)
-────────────────────────────────────────────────────────────────────
-- For security queries: ONLY TIC_Articles.pdf chunks are sent to the LLM.
-- No Loi 18-07, no other laws. This forces the correct answer.
+rag_query.py  v12 (final – explicit mapping for security queries)
 """
 
 import sys
@@ -66,7 +63,6 @@ QUERY_EXPANSION: dict[str, list[str]] = {
     "394 bis": ["394 bis code pénal accès frauduleux"],
 }
 
-
 def expand_query(query: str) -> str:
     q_lower = query.lower()
     extra = []
@@ -79,15 +75,12 @@ def expand_query(query: str) -> str:
         return query + " " + " ".join(unique)
     return query
 
-
 def is_security_query(query: str) -> bool:
     q = query.lower()
     return any(kw in q for kw in SECURITY_KEYWORDS)
 
-
 def tokenize(text: str) -> list[str]:
     return re.findall(r"[a-zA-ZÀ-ÿ0-9]+", text.lower())
-
 
 # ── Module init ───────────────────────────────────────────────────────────────
 
@@ -103,20 +96,22 @@ _bm25_chunks = bm25_data["chunks"]
 _groq = Groq(api_key=Config.GROQ_API_KEY)
 logger.info(f"RAG loaded. BM25 corpus: {len(_bm25_chunks)} chunks.")
 
+# ── System prompt with explicit mapping for security tools ───────────────────
 
 SYSTEM_PROMPT = """Tu es un assistant juridique pour étudiants de l'ESI Alger.
 
 RÈGLES ABSOLUES :
 1. Réponds en MAXIMUM 4 phrases.
-2. Base-toi UNIQUEMENT sur les extraits fournis. N'invente rien.
-3. Si la question concerne le hacking, les scans de réseau, ou l'accès non autorisé à un système informatique, tu DOIS utiliser les articles du Code pénal (394 bis, etc.) qui sont dans TIC_Articles.pdf.
-4. Ignore complètement la loi 18-07 (protection des données) pour ce type de questions – elle n'est pas pertinente.
-5. Cite toujours la loi et l'article (ex: Art. 394 bis du Code pénal).
-6. Si la réponse n'est pas dans les extraits : "Cette question n'est pas couverte par les textes disponibles."
-7. Réponds en français."""
+2. Base-toi UNIQUEMENT sur les extraits fournis (TIC_Articles.pdf). N'invente pas d'articles.
+3. Pour les questions sur les scans réseau (Nmap, Wireshark, etc.) :
+   - Un scan Nmap sur un réseau que tu ne possèdes pas constitue une TENTATIVE d'accès frauduleux à un système de traitement automatisé de données.
+   - Cela relève de l'article 394 bis (accès frauduleux) et de l'article 394 quater (tentative).
+   - Tu DOIS citer ces articles et dire que l'action est illégale.
+4. Les peines encourues : emprisonnement de 3 mois à 1 an et amende de 50 000 à 100 000 DA (art. 394 bis).
+5. Si la question n'est pas couverte, dis-le simplement.
+6. Réponds en français."""
 
-
-# ── Retrieval helpers ───────────────────────────────────────────────────────
+# ── Retrieval helpers (same as v11) ──────────────────────────────────────────
 
 def _cosine_search(query_emb, n):
     results = _collection.query(
@@ -135,7 +130,6 @@ def _cosine_search(query_emb, n):
         })
     return out
 
-
 def _bm25_search(query, n):
     tokens = tokenize(query)
     scores = _bm25.get_scores(tokens)
@@ -148,7 +142,6 @@ def _bm25_search(query, n):
         c["bm25_score"] = float(scores[idx])
         out.append(c)
     return out
-
 
 def _forced_tic_fetch(query_emb, n):
     results = _collection.query(
@@ -168,7 +161,6 @@ def _forced_tic_fetch(query_emb, n):
         })
     return out
 
-
 def _reciprocal_rank_fusion(cosine_list, bm25_list, k=RRF_K):
     rrf = {}
     for rank, c in enumerate(cosine_list, 1):
@@ -187,18 +179,13 @@ def _reciprocal_rank_fusion(cosine_list, bm25_list, k=RRF_K):
     merged.sort(key=lambda x: x["rrf_score"], reverse=True)
     return merged
 
-
 def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
     q_emb = _embed_model.encode(expanded).tolist()
-
     cosine_res = _cosine_search(q_emb, COSINE_FETCH)
     bm25_res = _bm25_search(expanded, BM25_FETCH)
     logger.info(f"[search] cosine={len(cosine_res)}, bm25={len(bm25_res)}")
-
     candidates = _reciprocal_rank_fusion(cosine_res, bm25_res)
     logger.info(f"[rrf] merged={len(candidates)}")
-
-    # Forced TIC fetch (only for security queries)
     if is_security_query(question):
         tic_forced = _forced_tic_fetch(q_emb, FORCED_TIC_FETCH)
         if tic_forced:
@@ -210,8 +197,6 @@ def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
             logger.info(f"[forced] added {len(tic_forced)} TIC chunks")
         else:
             logger.info("[forced] no TIC chunks found")
-
-    # Cross-encoder + priority boost
     if candidates:
         pairs = [(question, c["text"]) for c in candidates]
         scores = _cross_encoder.predict(pairs)
@@ -219,35 +204,27 @@ def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
             boost = PRIORITY_BOOST.get(c["priority"], 0.0)
             c["rerank_score"] = float(scores[i]) + boost
         candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
-
-    # AGGRESSIVE FILTER for security queries: keep ONLY TIC chunks
     if is_security_query(question):
         tic_only = [c for c in candidates if c["source"] == "TIC_Articles.pdf"]
         if tic_only:
             final = tic_only[:MAX_CONTEXT_CHUNKS]
-            logger.info(f"[filter] security query: using only {len(final)} TIC chunks (discarding others)")
+            logger.info(f"[filter] using only {len(final)} TIC chunks")
         else:
             final = candidates[:MAX_CONTEXT_CHUNKS]
-            logger.info("[filter] no TIC chunks found, using all")
     else:
         final = candidates[:MAX_CONTEXT_CHUNKS]
-
     logger.info("[final] Context order:")
     for i, c in enumerate(final):
         logger.info(f"  {i+1}. {c['source'][:40]} p{c['page']} | rerank={c.get('rerank_score', 0):.3f}")
     return final
 
-
 def answer_question(question: str) -> str:
     if not question.strip():
         return "Veuillez poser une question."
-
     expanded = expand_query(question)
     chunks = _retrieve_and_rerank(question, expanded)
-
     if not chunks:
         return "Je n'ai pas trouvé d'information pertinente."
-
     context_parts = []
     sources = []
     for i, c in enumerate(chunks, 1):
@@ -256,14 +233,12 @@ def answer_question(question: str) -> str:
         if label not in sources:
             sources.append(label)
     context_block = "\n\n".join(context_parts)
-
     user_msg = (
         f"Contexte juridique :\n\n{context_block}\n\n"
         f"Question : {question}\n\n"
-        "Réponds en 4 phrases MAXIMUM. Cite la loi et l'article. "
-        "Si la question concerne un scan réseau (Nmap, etc.), utilise impérativement les articles du Code pénal (394 bis, etc.) fournis dans TIC_Articles.pdf. Ignore la loi 18-07 pour ce type de question."
+        "Rappel : un scan Nmap sur un réseau public sans autorisation équivaut à une tentative d'accès frauduleux (art. 394 quater) et relève de l'art. 394 bis du Code pénal. "
+        "Si les extraits contiennent ces articles, utilise-les pour répondre que c'est illégal et donner les peines."
     )
-
     try:
         resp = _groq.chat.completions.create(
             model=GROQ_MODEL,
@@ -278,6 +253,5 @@ def answer_question(question: str) -> str:
     except Exception as e:
         logger.error(f"Groq error: {e}")
         raise RuntimeError(f"Erreur: {e}")
-
     sources_text = "\n\n📚 **Sources :**\n" + "\n".join(f"• {s}" for s in sources)
     return answer + sources_text
