@@ -1,3 +1,6 @@
+# database/connection.py  — lazy init, sync get_connection
+# Place this file at database/connection.py (overwrite the existing one)
+
 from psycopg2 import pool
 from config import Config
 from dotenv import load_dotenv
@@ -7,16 +10,9 @@ load_dotenv()
 
 class Database:
     def __init__(self):
-        # Don't connect here — connect lazily on first use.
-        # This lets the bot start even without a PostgreSQL server running.
         self.connection_pool = None
 
     def _ensure_pool(self) -> bool:
-        """
-        Create the connection pool on first use.
-        Returns True if ready, False if DB is not configured.
-        Never raises — DB-dependent cogs check the return value.
-        """
         if self.connection_pool is not None:
             return True
         if not Config.DATABASE_URL and not Config.DB_HOST:
@@ -38,10 +34,7 @@ class Database:
             return False
 
     def get_connection(self):
-        """
-        Returns a connection from the pool, or None if no DB is configured.
-        Callers must check for None before using the connection.
-        """
+        """Sync method — returns None if no DB configured."""
         if not self._ensure_pool():
             return None
         return self.connection_pool.getconn()
@@ -56,5 +49,4 @@ class Database:
             print("All connections closed")
 
 
-# Module-level instance — no connection attempt until get_connection() is called
 db = Database()
