@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 CHROMA_DB_DIR       = "./chroma_db"
 COLLECTION_NAME     = "cyber_law"
 EMBEDDING_MODEL     = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+CROSS_ENCODER_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 GROQ_MODEL          = "llama-3.3-70b-versatile"
 
 INITIAL_FETCH       = 40   # cosine candidates before reranking — cast wide
@@ -43,7 +43,7 @@ MAX_CONTEXT_CHUNKS  = 4    # chunks sent to LLM after reranking
 # P1 = core law (Penal Code, cybercrime law, 18-07) → big boost
 # P2 = supporting law                                → small boost
 # P3 = background                                    → no boost
-PRIORITY_BOOST = {1: 0.5, 2: 0.1, 3: 0.0}
+PRIORITY_BOOST = {1: 2.0, 2: 0.5, 3: 0.0}
 
 # ── Query expansion ────────────────────────────────────────────────────────────
 
