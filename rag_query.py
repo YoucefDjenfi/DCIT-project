@@ -1,9 +1,8 @@
 """
-rag_query.py  v10 (final, actually works)
-──────────────────────────────────────────
-- BM25 + cosine + RRF
-- Forced TIC fetch for security queries (CORRECTED)
-- Reorder: TIC chunks first in final context
+rag_query.py  v11 (final – aggressive filter for security queries)
+────────────────────────────────────────────────────────────────────
+- For security queries: ONLY TIC_Articles.pdf chunks are sent to the LLM.
+- No Loi 18-07, no other laws. This forces the correct answer.
 """
 
 import sys
@@ -35,7 +34,6 @@ COSINE_FETCH        = 30
 BM25_FETCH          = 30
 FORCED_TIC_FETCH    = 10
 RRF_K               = 60
-FORCED_TIC_COUNT    = 2
 MAX_CONTEXT_CHUNKS  = 4
 
 PRIORITY_BOOST = {1: 2.0, 2: 0.5, 3: 0.0}
@@ -101,24 +99,24 @@ _collection = _chroma.get_collection(COLLECTION_NAME)
 with open(BM25_INDEX_PATH, "rb") as f:
     bm25_data = pickle.load(f)
 _bm25 = bm25_data["bm25"]
-_bm25_chunks = bm25_data["chunks"]   # list of dicts with text, source, page, priority
+_bm25_chunks = bm25_data["chunks"]
 _groq = Groq(api_key=Config.GROQ_API_KEY)
 logger.info(f"RAG loaded. BM25 corpus: {len(_bm25_chunks)} chunks.")
 
 
 SYSTEM_PROMPT = """Tu es un assistant juridique pour étudiants de l'ESI Alger.
 
-RÈGLES :
+RÈGLES ABSOLUES :
 1. Réponds en MAXIMUM 4 phrases.
 2. Base-toi UNIQUEMENT sur les extraits fournis. N'invente rien.
-3. Commence directement par la réponse.
-4. Cite toujours la loi et l'article (ex: Art. 394 bis du Code pénal).
-5. Si un outil technique est mentionné, dis quelle infraction il constitue.
+3. Si la question concerne le hacking, les scans de réseau, ou l'accès non autorisé à un système informatique, tu DOIS utiliser les articles du Code pénal (394 bis, etc.) qui sont dans TIC_Articles.pdf.
+4. Ignore complètement la loi 18-07 (protection des données) pour ce type de questions – elle n'est pas pertinente.
+5. Cite toujours la loi et l'article (ex: Art. 394 bis du Code pénal).
 6. Si la réponse n'est pas dans les extraits : "Cette question n'est pas couverte par les textes disponibles."
 7. Réponds en français."""
 
 
-# ── Retrieval pipeline ───────────────────────────────────────────────────────
+# ── Retrieval helpers ───────────────────────────────────────────────────────
 
 def _cosine_search(query_emb, n):
     results = _collection.query(
@@ -153,7 +151,6 @@ def _bm25_search(query, n):
 
 
 def _forced_tic_fetch(query_emb, n):
-    """Fetch TIC_Articles.pdf chunks directly from ChromaDB."""
     results = _collection.query(
         query_embeddings=[query_emb],
         n_results=min(n, _collection.count()),
@@ -168,7 +165,6 @@ def _forced_tic_fetch(query_emb, n):
             "page": meta["page"],
             "priority": meta["priority"],
             "distance": dist,
-            "forced": True,
         })
     return out
 
@@ -195,20 +191,17 @@ def _reciprocal_rank_fusion(cosine_list, bm25_list, k=RRF_K):
 def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
     q_emb = _embed_model.encode(expanded).tolist()
 
-    # 1. Cosine and BM25
     cosine_res = _cosine_search(q_emb, COSINE_FETCH)
     bm25_res = _bm25_search(expanded, BM25_FETCH)
     logger.info(f"[search] cosine={len(cosine_res)}, bm25={len(bm25_res)}")
 
-    # 2. RRF merge
     candidates = _reciprocal_rank_fusion(cosine_res, bm25_res)
     logger.info(f"[rrf] merged={len(candidates)}")
 
-    # 3. Forced TIC fetch (ONLY if security query)
+    # Forced TIC fetch (only for security queries)
     if is_security_query(question):
         tic_forced = _forced_tic_fetch(q_emb, FORCED_TIC_FETCH)
         if tic_forced:
-            # Merge into candidates (avoid duplicates by text)
             existing = {c["text"] for c in candidates}
             for tc in tic_forced:
                 if tc["text"] not in existing:
@@ -216,9 +209,9 @@ def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
                     existing.add(tc["text"])
             logger.info(f"[forced] added {len(tic_forced)} TIC chunks")
         else:
-            logger.info("[forced] no TIC chunks found (TIC_Articles.pdf missing?)")
+            logger.info("[forced] no TIC chunks found")
 
-    # 4. Cross-encoder + priority boost
+    # Cross-encoder + priority boost
     if candidates:
         pairs = [(question, c["text"]) for c in candidates]
         scores = _cross_encoder.predict(pairs)
@@ -227,14 +220,15 @@ def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
             c["rerank_score"] = float(scores[i]) + boost
         candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
 
-    # 5. Reorder: TIC chunks first for security queries
+    # AGGRESSIVE FILTER for security queries: keep ONLY TIC chunks
     if is_security_query(question):
-        tic = [c for c in candidates if c["source"] == "TIC_Articles.pdf"]
-        others = [c for c in candidates if c["source"] != "TIC_Articles.pdf"]
-        top_tic = tic[:FORCED_TIC_COUNT]
-        remaining = others[:MAX_CONTEXT_CHUNKS - len(top_tic)]
-        final = top_tic + remaining
-        logger.info(f"[reorder] placed {len(top_tic)} TIC chunks first")
+        tic_only = [c for c in candidates if c["source"] == "TIC_Articles.pdf"]
+        if tic_only:
+            final = tic_only[:MAX_CONTEXT_CHUNKS]
+            logger.info(f"[filter] security query: using only {len(final)} TIC chunks (discarding others)")
+        else:
+            final = candidates[:MAX_CONTEXT_CHUNKS]
+            logger.info("[filter] no TIC chunks found, using all")
     else:
         final = candidates[:MAX_CONTEXT_CHUNKS]
 
@@ -267,7 +261,7 @@ def answer_question(question: str) -> str:
         f"Contexte juridique :\n\n{context_block}\n\n"
         f"Question : {question}\n\n"
         "Réponds en 4 phrases MAXIMUM. Cite la loi et l'article. "
-        "Si un outil technique est mentionné, nomme l'infraction légale qu'il constitue."
+        "Si la question concerne un scan réseau (Nmap, etc.), utilise impérativement les articles du Code pénal (394 bis, etc.) fournis dans TIC_Articles.pdf. Ignore la loi 18-07 pour ce type de question."
     )
 
     try:
