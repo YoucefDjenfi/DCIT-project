@@ -1,15 +1,17 @@
 """
-rag_query.py  v3
+rag_query.py  v4
 ────────────────
-Changes from v2:
-- Cross-encoder reranker: initial retrieval fetches 20 candidates, then a
-  cross-encoder scores each (question, chunk) pair semantically. This fixes
-  the Nmap problem — the Penal Code chunk about "accès frauduleux" now ranks
-  above the Loi 18-07 chunk about "réseaux publics" even though cosine
-  similarity favoured 18-07.
-- max_tokens reduced to 450 so responses fit Discord without truncation
-- System prompt hardened: 4-sentence limit, no hedging unless genuinely absent
-- Query expansion extended with article numbers as search terms
+Root cause fix: the cross-encoder was never seeing Penal Code chunks because
+the pre-filter (distance < 0.80) excluded them before reranking. Fixed by:
+- Removing the distance pre-filter entirely — all top-N cosine candidates
+  go to the cross-encoder regardless of distance score
+- Increasing INITIAL_FETCH to 40 so the Penal Code has a better chance of
+  appearing in the candidate pool even when cosine similarity is mediocre
+- Priority boost: P1 chunks get +0.5 added to their cross-encoder score,
+  ensuring core law always ranks above background documents when relevance
+  is otherwise similar
+- Debug logging: logs the top 5 candidates after reranking so you can see
+  exactly what's being sent to the LLM (visible in terminal when bot runs)
 """
 
 import sys
@@ -32,57 +34,79 @@ CHROMA_DB_DIR       = "./chroma_db"
 COLLECTION_NAME     = "cyber_law"
 EMBEDDING_MODEL     = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-
 GROQ_MODEL          = "llama-3.3-70b-versatile"
 
-# Retrieval: fetch wide, then rerank down to a small context
-INITIAL_FETCH       = 20    # candidates pulled from ChromaDB before reranking
-MAX_CONTEXT_CHUNKS  = 4     # chunks actually sent to the LLM after reranking
-DISTANCE_THRESHOLD  = 0.80  # looser than before — reranker does precision work
+INITIAL_FETCH       = 40   # cosine candidates before reranking — cast wide
+MAX_CONTEXT_CHUNKS  = 4    # chunks sent to LLM after reranking
+
+# Priority score boost added to cross-encoder score before final ranking.
+# P1 = core law (Penal Code, cybercrime law, 18-07) → big boost
+# P2 = supporting law                                → small boost
+# P3 = background                                    → no boost
+PRIORITY_BOOST = {1: 0.5, 2: 0.1, 3: 0.0}
 
 # ── Query expansion ────────────────────────────────────────────────────────────
 
 QUERY_EXPANSION: dict[str, list[str]] = {
     "nmap": [
-        "accès frauduleux", "système de traitement automatisé de données",
-        "intrusion réseau", "394 bis", "accès non autorisé système informatique",
+        "accès frauduleux système traitement automatisé données",
+        "394 bis code pénal",
+        "intrusion réseau informatique non autorisé",
+        "pénétration système informatique",
     ],
-    "scan": ["accès frauduleux", "système de traitement automatisé", "394 bis"],
-    "scanning": ["accès frauduleux", "système de traitement automatisé", "394 bis"],
-    "wireshark": ["interception", "écoute réseau", "accès frauduleux", "394 ter"],
-    "sniffing": ["interception des communications", "écoute illégale", "accès frauduleux"],
-    "ddos": ["atteinte au fonctionnement", "système de traitement automatisé", "394 quater"],
-    "dos": ["atteinte au fonctionnement du système", "394 quater"],
-    "hacking": ["accès frauduleux", "394 bis", "394 ter"],
-    "hack": ["accès frauduleux", "394 bis", "système informatique"],
-    "exploit": ["accès frauduleux", "vulnérabilité", "394 bis"],
-    "bruteforce": ["accès frauduleux", "tentative accès non autorisé", "394 bis"],
-    "phishing": ["fraude informatique", "usurpation d'identité", "escroquerie"],
-    "malware": ["logiciel malveillant", "atteinte aux données", "394 quater"],
-    "ransomware": ["atteinte aux données", "extorsion", "394 quater"],
-    "virus": ["logiciel malveillant", "atteinte système informatique", "394 quater"],
-    "keylogger": ["logiciel espion", "interception", "données à caractère personnel"],
-    "spyware": ["logiciel espion", "surveillance illégale", "données personnelles"],
-    "sql injection": ["accès frauduleux", "altération de données", "394 ter"],
-    "injection": ["accès frauduleux", "altération de données", "394 ter"],
-    "xss": ["atteinte aux données", "fraude informatique"],
-    "tracking": ["données à caractère personnel", "vie privée", "loi 18-07"],
-    "cookies": ["données à caractère personnel", "consentement", "loi 18-07"],
-    "vpn": ["réseau privé virtuel", "anonymisation", "communications électroniques"],
-    "tor": ["anonymisation", "accès réseau", "communications électroniques"],
-    "cyberbullying": ["harcèlement en ligne", "cyberharcèlement", "atteinte à la dignité"],
-    "harcèlement": ["cyberharcèlement", "harcèlement", "atteinte vie privée"],
-    "fake news": ["désinformation", "fausses nouvelles", "atteinte ordre public"],
-    "deepfake": ["usurpation d'identité", "atteinte à la dignité", "falsification"],
-    "doxxing": ["divulgation données personnelles", "atteinte vie privée", "loi 18-07"],
-    "wifi": ["système de traitement automatisé", "réseau communications électroniques", "394 bis"],
-    "wi-fi": ["système de traitement automatisé", "accès non autorisé", "394 bis"],
-    "réseau": ["système de traitement automatisé de données", "communications électroniques"],
-    "serveur": ["système de traitement automatisé de données", "infrastructure"],
-    "cryptage": ["chiffrement", "signature électronique", "loi 15-04"],
-    "chiffrement": ["signature électronique", "loi 15-04", "certification électronique"],
-    "mot de passe": ["accès frauduleux", "données d'authentification", "394 bis"],
-    "password": ["accès frauduleux", "données d'authentification", "394 bis"],
+    "scan": [
+        "accès frauduleux système traitement automatisé",
+        "394 bis",
+        "intrusion réseau",
+    ],
+    "scanning":        ["accès frauduleux système traitement automatisé", "394 bis"],
+    "wireshark":       ["interception communications", "accès frauduleux", "394 ter"],
+    "sniffing":        ["interception communications électroniques", "accès frauduleux"],
+    "ddos":            ["atteinte fonctionnement système traitement automatisé", "394 quater"],
+    "dos":             ["atteinte fonctionnement système", "394 quater"],
+    "hacking":         ["accès frauduleux système informatique", "394 bis code pénal"],
+    "hack":            ["accès frauduleux", "394 bis", "système informatique"],
+    "exploit":         ["accès frauduleux vulnérabilité", "394 bis"],
+    "bruteforce":      ["accès frauduleux tentative", "394 bis"],
+    "phishing":        ["fraude informatique usurpation identité", "escroquerie"],
+    "malware":         ["logiciel malveillant atteinte données", "394 quater"],
+    "ransomware":      ["atteinte données extorsion", "394 quater"],
+    "virus":           ["logiciel malveillant atteinte système", "394 quater"],
+    "keylogger":       ["logiciel espion interception", "données caractère personnel"],
+    "spyware":         ["logiciel espion surveillance illégale", "données personnelles"],
+    "sql injection":   ["accès frauduleux altération données", "394 ter"],
+    "injection":       ["accès frauduleux altération données", "394 ter"],
+    "xss":             ["atteinte données fraude informatique"],
+    "tracking":        ["données caractère personnel traçage", "loi 18-07"],
+    "cookies":         ["données caractère personnel consentement", "loi 18-07"],
+    "vpn":             ["réseau privé virtuel anonymisation", "communications électroniques"],
+    "tor":             ["anonymisation accès réseau", "communications électroniques"],
+    "cyberbullying":   ["harcèlement cyberharcèlement ligne", "atteinte dignité"],
+    "harcèlement":     ["cyberharcèlement harcèlement ligne", "atteinte vie privée"],
+    "fake news":       ["désinformation fausses nouvelles", "atteinte ordre public"],
+    "deepfake":        ["usurpation identité atteinte dignité", "falsification"],
+    "doxxing":         ["divulgation données personnelles", "atteinte vie privée loi 18-07"],
+    "wifi":            [
+        "système traitement automatisé réseau",
+        "accès non autorisé réseau informatique",
+        "394 bis",
+    ],
+    "wi-fi":           ["système traitement automatisé", "accès non autorisé", "394 bis"],
+    "réseau":          ["système traitement automatisé données", "communications électroniques"],
+    "network":         ["système traitement automatisé", "réseau informatique", "394 bis"],
+    "serveur":         ["système traitement automatisé infrastructure"],
+    "cryptage":        ["chiffrement signature électronique", "loi 15-04"],
+    "chiffrement":     ["signature électronique loi 15-04", "certification électronique"],
+    "mot de passe":    ["accès frauduleux données authentification", "394 bis"],
+    "password":        ["accès frauduleux données authentification", "394 bis"],
+    # English terms (for English-language queries)
+    "unauthorized":    ["accès frauduleux non autorisé", "394 bis"],
+    "illegal":         ["infraction pénale", "accès frauduleux", "394 bis"],
+    "charges":         ["sanctions pénales", "emprisonnement amende", "394 bis code pénal"],
+    "penalty":         ["peine emprisonnement amende", "sanctions", "394 bis"],
+    "penalties":       ["peines sanctions", "emprisonnement amende", "394 bis"],
+    "criminal":        ["infraction pénale", "code pénal", "394 bis"],
+    "crime":           ["infraction cybercriminalité", "loi 09-04", "394 bis"],
 }
 
 
@@ -95,8 +119,8 @@ def expand_query(query: str) -> str:
     if extra:
         seen: set[str] = set()
         unique = [t for t in extra if not (t in seen or seen.add(t))]
-        expanded = query + " | " + " | ".join(unique)
-        logger.debug(f"Expanded: {expanded}")
+        expanded = query + " " + " ".join(unique)
+        logger.info(f"[expand] Added {len(unique)} terms")
         return expanded
     return query
 
@@ -104,38 +128,43 @@ def expand_query(query: str) -> str:
 # ── Module-level init ─────────────────────────────────────────────────────────
 
 logger.info("Loading RAG components...")
-
-_embed_model    = SentenceTransformer(EMBEDDING_MODEL)
-_cross_encoder  = CrossEncoder(CROSS_ENCODER_MODEL)
-
-_chroma         = chromadb.PersistentClient(path=CHROMA_DB_DIR)
-_collection     = _chroma.get_collection(COLLECTION_NAME)
-_groq           = Groq(api_key=Config.GROQ_API_KEY)
-
+_embed_model   = SentenceTransformer(EMBEDDING_MODEL)
+_cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+_chroma        = chromadb.PersistentClient(path=CHROMA_DB_DIR)
+_collection    = _chroma.get_collection(COLLECTION_NAME)
+_groq          = Groq(api_key=Config.GROQ_API_KEY)
 logger.info("RAG components loaded.")
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """Tu es un assistant juridique pour étudiants de l'ESI Alger, spécialisé en droit algérien du numérique.
 
-Règles STRICTES — respecte-les sans exception :
-1. Réponds en MAXIMUM 4 phrases. Pas plus. Jamais.
+RÈGLES ABSOLUES :
+1. Réponds en MAXIMUM 4 phrases. Jamais plus.
 2. Base-toi UNIQUEMENT sur les extraits fournis. N'invente rien.
-3. Si la réponse est absente des extraits, réponds : "Cette question dépasse le contenu des textes juridiques disponibles." — puis arrête-toi.
-4. Cite toujours la loi et l'article (ex : Art. 394 bis du Code pénal).
-5. Va droit au but : commence par la réponse, pas par des généralités.
-6. Si la question mentionne un outil technique (Nmap, DDoS, etc.), dis explicitement quelle infraction il constitue selon les extraits.
-7. Réponds toujours en français."""
-
+3. Commence directement par la réponse — pas de préambule, pas de "selon les extraits".
+4. Cite toujours la loi et l'article (ex: Art. 394 bis du Code pénal).
+5. Si un outil technique est mentionné (Nmap, DDoS, etc.), dis explicitement quelle infraction il constitue.
+6. Si la réponse est absente des extraits : "Cette question n'est pas couverte par les textes disponibles." — puis stop.
+7. Réponds en français même si la question est en anglais ou en arabe."""
 
 # ── Retrieval + reranking ─────────────────────────────────────────────────────
 
 def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
     """
-    1. Embed the expanded query and fetch INITIAL_FETCH candidates from ChromaDB
-       (no priority filter at this stage — cast a wide net).
-    2. Rerank all candidates using a cross-encoder scoring (question, chunk_text).
-    3. Return the top MAX_CONTEXT_CHUNKS by reranker score.
+    Step 1 — Cosine retrieval: fetch INITIAL_FETCH candidates from ChromaDB.
+             No distance filter here — we want a wide net so the cross-encoder
+             gets a chance to see ALL potentially relevant chunks, including
+             Penal Code chunks that may have mediocre cosine scores.
+
+    Step 2 — Cross-encoder reranking: score each (original question, chunk)
+             pair. The cross-encoder reads both together and scores semantic
+             relevance, not word overlap.
+
+    Step 3 — Priority boost: add a fixed score bonus for P1 documents so core
+             law always beats background documents when relevance is close.
+
+    Step 4 — Return top MAX_CONTEXT_CHUNKS.
     """
     q_emb = _embed_model.encode(expanded).tolist()
 
@@ -145,6 +174,7 @@ def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
         include=["documents", "metadatas", "distances"],
     )
 
+    # No distance filter — take all INITIAL_FETCH candidates
     candidates = [
         {
             "text":     doc,
@@ -158,30 +188,26 @@ def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
             results["metadatas"][0],
             results["distances"][0],
         )
-        if dist < DISTANCE_THRESHOLD
     ]
 
-    if not candidates:
-        # Fallback: loosen threshold, take whatever we have
-        candidates = [
-            {"text": doc, "source": meta["source"], "page": meta["page"],
-             "priority": meta["priority"], "distance": dist}
-            for doc, meta, dist in zip(
-                results["documents"][0],
-                results["metadatas"][0],
-                results["distances"][0],
-            )
-        ]
-
-    # Cross-encoder reranking: score each (original_question, chunk) pair
-    pairs = [(question, c["text"]) for c in candidates]
+    # Cross-encoder: score (original question, chunk) pairs
+    # Using the original question (not expanded) for more natural scoring
+    pairs  = [(question, c["text"]) for c in candidates]
     scores = _cross_encoder.predict(pairs)
 
-    for i, score in enumerate(scores):
-        candidates[i]["rerank_score"] = float(score)
+    for i, c in enumerate(candidates):
+        boost = PRIORITY_BOOST.get(c["priority"], 0.0)
+        c["rerank_score"] = float(scores[i]) + boost
 
-    # Sort by reranker score descending (higher = more relevant)
     candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
+
+    # Debug: log top 5 so you can see what's being sent to the LLM
+    logger.info("[rerank] Top 5 chunks after reranking:")
+    for i, c in enumerate(candidates[:5]):
+        logger.info(
+            f"  {i+1}. [{c['source'][:40]}] p{c['page']} "
+            f"| cosine={c['distance']:.3f} | rerank={c['rerank_score']:.3f} | P{c['priority']}"
+        )
 
     return candidates[:MAX_CONTEXT_CHUNKS]
 
@@ -204,8 +230,7 @@ def answer_question(question: str) -> str:
     for i, c in enumerate(chunks, 1):
         label = f"{c['source']} (page {c['page']})"
         context_parts.append(
-            f"--- Extrait {i} | {label} | "
-            f"Score : {c.get('rerank_score', 0):.2f} ---\n{c['text']}"
+            f"--- Extrait {i} | {label} ---\n{c['text']}"
         )
         if label not in sources_seen:
             sources_seen.append(label)
@@ -215,8 +240,8 @@ def answer_question(question: str) -> str:
     user_message = (
         f"Contexte juridique :\n\n{context_block}\n\n"
         f"Question : {question}\n\n"
-        "Réponds en 4 phrases maximum. Cite la loi et l'article. "
-        "Si un outil technique est mentionné, dis quelle infraction il constitue."
+        "Réponds en 4 phrases MAXIMUM. Cite la loi et l'article. "
+        "Si un outil technique est mentionné, nomme l'infraction légale qu'il constitue."
     )
 
     try:
