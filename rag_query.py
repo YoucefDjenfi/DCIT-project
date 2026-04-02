@@ -1,17 +1,7 @@
 """
-rag_query.py  v4
+rag_query.py  v5
 ────────────────
-Root cause fix: the cross-encoder was never seeing Penal Code chunks because
-the pre-filter (distance < 0.80) excluded them before reranking. Fixed by:
-- Removing the distance pre-filter entirely — all top-N cosine candidates
-  go to the cross-encoder regardless of distance score
-- Increasing INITIAL_FETCH to 40 so the Penal Code has a better chance of
-  appearing in the candidate pool even when cosine similarity is mediocre
-- Priority boost: P1 chunks get +0.5 added to their cross-encoder score,
-  ensuring core law always ranks above background documents when relevance
-  is otherwise similar
-- Debug logging: logs the top 5 candidates after reranking so you can see
-  exactly what's being sent to the LLM (visible in terminal when bot runs)
+Forced inclusion of Penal Code for security-related queries.
 """
 
 import sys
@@ -36,16 +26,22 @@ EMBEDDING_MODEL     = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-
 CROSS_ENCODER_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 GROQ_MODEL          = "llama-3.3-70b-versatile"
 
-INITIAL_FETCH       = 40   # cosine candidates before reranking — cast wide
-MAX_CONTEXT_CHUNKS  = 4    # chunks sent to LLM after reranking
+INITIAL_FETCH       = 30          # general cosine candidates
+PENAL_CODE_FETCH    = 10          # forced Penal Code candidates (if query is security-related)
+MAX_CONTEXT_CHUNKS  = 4
 
-# Priority score boost added to cross-encoder score before final ranking.
-# P1 = core law (Penal Code, cybercrime law, 18-07) → big boost
-# P2 = supporting law                                → small boost
-# P3 = background                                    → no boost
 PRIORITY_BOOST = {1: 2.0, 2: 0.5, 3: 0.0}
 
-# ── Query expansion ────────────────────────────────────────────────────────────
+# Keywords that trigger forced Penal Code retrieval
+SECURITY_KEYWORDS = [
+    "nmap", "scan", "scanning", "wireshark", "sniffing", "ddos", "dos", "hack", "hacking",
+    "exploit", "bruteforce", "phishing", "malware", "ransomware", "virus", "keylogger",
+    "spyware", "sql injection", "injection", "xss", "wifi", "wi-fi", "réseau", "network",
+    "serveur", "mot de passe", "password", "unauthorized", "illegal", "charges", "penalty",
+    "penalties", "criminal", "crime", "accès frauduleux", "394 bis", "intrusion", "cybercrime"
+]
+
+# ── Query expansion (same as before) ────────────────────────────────────────────
 
 QUERY_EXPANSION: dict[str, list[str]] = {
     "nmap": [
@@ -99,7 +95,6 @@ QUERY_EXPANSION: dict[str, list[str]] = {
     "chiffrement":     ["signature électronique loi 15-04", "certification électronique"],
     "mot de passe":    ["accès frauduleux données authentification", "394 bis"],
     "password":        ["accès frauduleux données authentification", "394 bis"],
-    # English terms (for English-language queries)
     "unauthorized":    ["accès frauduleux non autorisé", "394 bis"],
     "illegal":         ["infraction pénale", "accès frauduleux", "394 bis"],
     "charges":         ["sanctions pénales", "emprisonnement amende", "394 bis code pénal"],
@@ -119,10 +114,15 @@ def expand_query(query: str) -> str:
     if extra:
         seen: set[str] = set()
         unique = [t for t in extra if not (t in seen or seen.add(t))]
-        expanded = query + " " + " ".join(unique)
         logger.info(f"[expand] Added {len(unique)} terms")
-        return expanded
+        return query + " " + " ".join(unique)
     return query
+
+
+def is_security_query(query: str) -> bool:
+    """Return True if query contains any security keyword (case-insensitive)."""
+    q_lower = query.lower()
+    return any(kw in q_lower for kw in SECURITY_KEYWORDS)
 
 
 # ── Module-level init ─────────────────────────────────────────────────────────
@@ -135,7 +135,7 @@ _collection    = _chroma.get_collection(COLLECTION_NAME)
 _groq          = Groq(api_key=Config.GROQ_API_KEY)
 logger.info("RAG components loaded.")
 
-# ── System prompt ─────────────────────────────────────────────────────────────
+# ── System prompt (same) ─────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """Tu es un assistant juridique pour étudiants de l'ESI Alger, spécialisé en droit algérien du numérique.
 
@@ -148,33 +148,17 @@ RÈGLES ABSOLUES :
 6. Si la réponse est absente des extraits : "Cette question n'est pas couverte par les textes disponibles." — puis stop.
 7. Réponds en français même si la question est en anglais ou en arabe."""
 
-# ── Retrieval + reranking ─────────────────────────────────────────────────────
+# ── Retrieval + reranking with forced Penal Code inclusion ────────────────────
 
 def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
-    """
-    Step 1 — Cosine retrieval: fetch INITIAL_FETCH candidates from ChromaDB.
-             No distance filter here — we want a wide net so the cross-encoder
-             gets a chance to see ALL potentially relevant chunks, including
-             Penal Code chunks that may have mediocre cosine scores.
-
-    Step 2 — Cross-encoder reranking: score each (original question, chunk)
-             pair. The cross-encoder reads both together and scores semantic
-             relevance, not word overlap.
-
-    Step 3 — Priority boost: add a fixed score bonus for P1 documents so core
-             law always beats background documents when relevance is close.
-
-    Step 4 — Return top MAX_CONTEXT_CHUNKS.
-    """
+    # 1. General cosine search
     q_emb = _embed_model.encode(expanded).tolist()
-
-    results = _collection.query(
+    general_results = _collection.query(
         query_embeddings=[q_emb],
         n_results=min(INITIAL_FETCH, _collection.count()),
         include=["documents", "metadatas", "distances"],
     )
 
-    # No distance filter — take all INITIAL_FETCH candidates
     candidates = [
         {
             "text":     doc,
@@ -184,15 +168,45 @@ def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
             "distance": dist,
         }
         for doc, meta, dist in zip(
-            results["documents"][0],
-            results["metadatas"][0],
-            results["distances"][0],
+            general_results["documents"][0],
+            general_results["metadatas"][0],
+            general_results["distances"][0],
         )
     ]
 
-    # Cross-encoder: score (original question, chunk) pairs
-    # Using the original question (not expanded) for more natural scoring
-    pairs  = [(question, c["text"]) for c in candidates]
+    # 2. If security-related query, force-include top Penal Code chunks
+    if is_security_query(question):
+        # Search only the Penal Code PDF (metadata filter)
+        penal_results = _collection.query(
+            query_embeddings=[q_emb],
+            n_results=min(PENAL_CODE_FETCH, _collection.count()),
+            where={"source": "2016_Algeria_fr_Code Penal.pdf"},
+            include=["documents", "metadatas", "distances"],
+        )
+        penal_chunks = [
+            {
+                "text":     doc,
+                "source":   meta["source"],
+                "page":     meta["page"],
+                "priority": meta["priority"],
+                "distance": dist,
+            }
+            for doc, meta, dist in zip(
+                penal_results["documents"][0],
+                penal_results["metadatas"][0],
+                penal_results["distances"][0],
+            )
+        ]
+        # Merge, avoiding duplicates (by text content – simple heuristic)
+        existing_texts = {c["text"] for c in candidates}
+        for pc in penal_chunks:
+            if pc["text"] not in existing_texts:
+                candidates.append(pc)
+                existing_texts.add(pc["text"])
+        logger.info(f"[force] Added {len(penal_chunks)} Penal Code chunks to candidates (total now {len(candidates)})")
+
+    # 3. Cross-encoder scoring
+    pairs = [(question, c["text"]) for c in candidates]
     scores = _cross_encoder.predict(pairs)
 
     for i, c in enumerate(candidates):
@@ -201,7 +215,7 @@ def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
 
     candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
 
-    # Debug: log top 5 so you can see what's being sent to the LLM
+    # Debug log
     logger.info("[rerank] Top 5 chunks after reranking:")
     for i, c in enumerate(candidates[:5]):
         logger.info(
@@ -229,9 +243,7 @@ def answer_question(question: str) -> str:
 
     for i, c in enumerate(chunks, 1):
         label = f"{c['source']} (page {c['page']})"
-        context_parts.append(
-            f"--- Extrait {i} | {label} ---\n{c['text']}"
-        )
+        context_parts.append(f"--- Extrait {i} | {label} ---\n{c['text']}")
         if label not in sources_seen:
             sources_seen.append(label)
 
