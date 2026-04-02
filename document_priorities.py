@@ -30,6 +30,7 @@ DOCUMENT_PRIORITIES: dict[str, int] = {
 }
 
 SKIP_FILES: set[str] = {
+    "Unofficial English Translation of DZ_AR_CopyrightLaw_2003 2.pdf",
     "2017_en_Project CyberSouth.pdf",
     "2019_Algeria_en_Expressed Views at the OEWG on Developments in the Field of ICTs.pdf",
     "DZ_AR_Penal_Code_Amendment_2009.pdf",
