@@ -7,6 +7,7 @@
 DOCUMENT_PRIORITIES: dict[str, int] = {
 
     # ── Priority 1: Core domestic cyber law ──────────────────────────────────
+    "TIC_Articles.pdf": 1,
     "DZ_FR_Cybercrime Law_2009.pdf": 1,
     "2016_Algeria_fr_Code Penal.pdf": 1,
     "2018_Algeria_fr_Loi n_ 18-07 du 25 Ramadhan 1439 correspondant au 10 juin 2018 relative à la protection des personnes physiques dans le traitement des données à caractère personnel.pdf": 1,
