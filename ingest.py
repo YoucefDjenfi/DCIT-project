@@ -1,24 +1,39 @@
 """
-ingest.py  v5
+ingest.py  v6
 ─────────────
-Removed ALL page/keyword filtering from the Penal Code.
-The full 362-page PDF is ingested. The cross-encoder handles precision.
-18 chunks from 4 pages is not enough — we need all TIC articles.
+Builds two search indexes from knowledge_base/ in a single run:
+
+  1. ChromaDB  — vector store for cosine (semantic) search
+  2. bm25_index.pkl — BM25 keyword index for exact-term matching
+
+Both use the identical chunk list so IDs line up perfectly.
+BM25 directly solves the Nmap problem: "394 bis" and "accès frauduleux"
+are exact keyword matches — no embedding needed.
+
+Usage:
+    python ingest.py
+
+Run again whenever you add or update PDFs.
 """
 
 import re
 import sys
+import pickle
 from pathlib import Path
 
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
 import chromadb
 
 sys.path.insert(0, str(Path(__file__).parent))
 from document_priorities import get_priority, should_skip
 
+# ── Config ────────────────────────────────────────────────────────────────────
+
 KNOWLEDGE_BASE_DIR = "./knowledge_base"
 CHROMA_DB_DIR      = "./chroma_db"
+BM25_INDEX_PATH    = "./bm25_index.pkl"
 COLLECTION_NAME    = "cyber_law"
 EMBEDDING_MODEL    = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 CHUNK_SIZE         = 800
@@ -41,6 +56,8 @@ ARTICLE_PATTERN = re.compile(
 )
 
 
+# ── Text helpers ──────────────────────────────────────────────────────────────
+
 def clean_text(text: str) -> str:
     for p in BOILERPLATE_PATTERNS:
         text = p.sub(" ", text)
@@ -49,8 +66,17 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def tokenize_for_bm25(text: str) -> list[str]:
+    """
+    Simple whitespace + punctuation tokenizer for BM25.
+    Lowercases and strips noise. French stopwords are kept intentionally —
+    legal text relies on exact phrases like "de données à caractère personnel".
+    """
+    tokens = re.findall(r"[a-zA-ZÀ-ÿ0-9]+", text.lower())
+    return tokens
+
+
 def extract_pages(pdf_path: str) -> list[tuple[str, int]]:
-    """Extract ALL pages — no filtering. Cross-encoder handles relevance."""
     pages = []
     try:
         reader = PdfReader(pdf_path)
@@ -97,6 +123,8 @@ def chunk_text(text: str, source: str, page: int, priority: int) -> list[dict]:
     return chunks
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def build_database():
     pdf_dir = Path(KNOWLEDGE_BASE_DIR)
     if not pdf_dir.exists():
@@ -111,7 +139,6 @@ def build_database():
 
     for pdf_path in pdf_files:
         filename = pdf_path.name
-
         if should_skip(filename):
             print(f"  [SKIP] {filename}")
             skipped.append(filename)
@@ -119,7 +146,6 @@ def build_database():
 
         priority = get_priority(filename)
         print(f"  [P{priority}] {filename}")
-
         pages = extract_pages(str(pdf_path))
         if not pages:
             print(f"       ⚠ No extractable text. Skipping.")
@@ -129,16 +155,15 @@ def build_database():
         file_chunks = []
         for page_text, page_num in pages:
             file_chunks.extend(chunk_text(page_text, filename, page_num, priority))
-
         print(f"       → {len(pages)} pages, {len(file_chunks)} chunks")
         all_chunks.extend(file_chunks)
 
     print(f"\nSkipped: {skipped}")
     print(f"Total chunks: {len(all_chunks)}\n")
 
-    print(f"Loading embedding model...")
+    # ── 1. Embed and store in ChromaDB ────────────────────────────────────────
+    print("Loading embedding model...")
     model = SentenceTransformer(EMBEDDING_MODEL)
-
     print("Embedding...")
     texts      = [c["text"] for c in all_chunks]
     embeddings = model.encode(texts, show_progress_bar=True, batch_size=32)
@@ -170,11 +195,29 @@ def build_database():
             ],
         )
 
-    print(f"\n✅ Done. {len(all_chunks)} chunks in {CHROMA_DB_DIR}/")
+    # ── 2. Build BM25 index from the SAME chunks ──────────────────────────────
+    print("\nBuilding BM25 keyword index...")
+    tokenized_corpus = [tokenize_for_bm25(c["text"]) for c in all_chunks]
+    bm25 = BM25Okapi(tokenized_corpus)
+
+    # Save: the BM25 object + the full chunk list (for metadata lookup by index)
+    bm25_payload = {
+        "bm25":   bm25,
+        "chunks": all_chunks,   # same order as the BM25 corpus
+    }
+    with open(BM25_INDEX_PATH, "wb") as f:
+        pickle.dump(bm25_payload, f)
+    print(f"✓ BM25 index saved to {BM25_INDEX_PATH}")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print(f"\n✅ Done. {len(all_chunks)} chunks indexed.")
     for tier in [1, 2, 3]:
         n = sum(1 for c in all_chunks if c["priority"] == tier)
         print(f"  Priority {tier}: {n} chunks")
-    print(f"\nPenal Code chunks: {sum(1 for c in all_chunks if '2016_Algeria_fr_Code Penal' in c['source'])}")
+    pc = sum(1 for c in all_chunks if "2016_Algeria_fr_Code Penal" in c["source"])
+    tic = sum(1 for c in all_chunks if c["source"] == "TIC_Articles.pdf")
+    print(f"  Penal Code chunks: {pc}")
+    print(f"  TIC_Articles chunks: {tic}")
 
 
 if __name__ == "__main__":
