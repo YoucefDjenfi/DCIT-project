@@ -1,8 +1,8 @@
 """
-rag_query.py  v6
+rag_query.py  v7
 ────────────────
-For security queries: force at least 2 Penal Code chunks into the final context,
-bypassing cross-encoder scores if necessary.
+For security queries: force at least 2 chunks from TIC_Articles.pdf
+(articles 394 bis to 394 nonies) into the final context.
 """
 
 import sys
@@ -27,14 +27,14 @@ EMBEDDING_MODEL     = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-
 CROSS_ENCODER_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 GROQ_MODEL          = "llama-3.3-70b-versatile"
 
-INITIAL_FETCH       = 30          # general cosine candidates
-PENAL_CODE_FETCH    = 10          # forced Penal Code candidates (if query is security-related)
-FORCED_PENAL_COUNT  = 2           # number of Penal Code chunks to force into final context
+INITIAL_FETCH       = 30
+TIC_FETCH           = 10          # fetch from TIC_Articles.pdf
+FORCED_TIC_COUNT    = 2
 MAX_CONTEXT_CHUNKS  = 4
 
 PRIORITY_BOOST = {1: 2.0, 2: 0.5, 3: 0.0}
 
-# Keywords that trigger forced Penal Code retrieval
+# Keywords that trigger forced TIC retrieval
 SECURITY_KEYWORDS = [
     "nmap", "scan", "scanning", "wireshark", "sniffing", "ddos", "dos", "hack", "hacking",
     "exploit", "bruteforce", "phishing", "malware", "ransomware", "virus", "keylogger",
@@ -43,7 +43,7 @@ SECURITY_KEYWORDS = [
     "penalties", "criminal", "crime", "accès frauduleux", "394 bis", "intrusion", "cybercrime"
 ]
 
-# ── Query expansion ────────────────────────────────────────────────────────────
+# ── Query expansion (unchanged) ──────────────────────────────────────────────
 
 QUERY_EXPANSION: dict[str, list[str]] = {
     "nmap": [
@@ -106,7 +106,6 @@ QUERY_EXPANSION: dict[str, list[str]] = {
     "crime":           ["infraction cybercriminalité", "loi 09-04", "394 bis"],
 }
 
-
 def expand_query(query: str) -> str:
     query_lower = query.lower()
     extra: list[str] = []
@@ -120,11 +119,9 @@ def expand_query(query: str) -> str:
         return query + " " + " ".join(unique)
     return query
 
-
 def is_security_query(query: str) -> bool:
     q_lower = query.lower()
     return any(kw in q_lower for kw in SECURITY_KEYWORDS)
-
 
 # ── Module-level init ─────────────────────────────────────────────────────────
 
@@ -147,97 +144,76 @@ RÈGLES ABSOLUES :
 6. Si la réponse est absente des extraits : "Cette question n'est pas couverte par les textes disponibles." — puis stop.
 7. Réponds en français même si la question est en anglais ou en arabe."""
 
-
 def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
-    # 1. General cosine search
     q_emb = _embed_model.encode(expanded).tolist()
+
+    # General cosine search
     general_results = _collection.query(
         query_embeddings=[q_emb],
         n_results=min(INITIAL_FETCH, _collection.count()),
         include=["documents", "metadatas", "distances"],
     )
-
     candidates = []
-    penal_chunks = []  # store separately for forced inclusion
-
     for doc, meta, dist in zip(
         general_results["documents"][0],
         general_results["metadatas"][0],
         general_results["distances"][0],
     ):
-        c = {
-            "text":     doc,
-            "source":   meta["source"],
-            "page":     meta["page"],
-            "priority": meta["priority"],
-            "distance": dist,
-        }
-        candidates.append(c)
-        if meta["source"] == "2016_Algeria_fr_Code Penal.pdf":
-            penal_chunks.append(c)
+        candidates.append({
+            "text": doc, "source": meta["source"], "page": meta["page"],
+            "priority": meta["priority"], "distance": dist
+        })
 
-    # 2. If security query, fetch additional Penal Code chunks (even if not in top general)
+    # For security queries, force‑fetch from TIC_Articles.pdf
     if is_security_query(question):
-        penal_results = _collection.query(
+        tic_results = _collection.query(
             query_embeddings=[q_emb],
-            n_results=min(PENAL_CODE_FETCH, _collection.count()),
-            where={"source": "2016_Algeria_fr_Code Penal.pdf"},
+            n_results=min(TIC_FETCH, _collection.count()),
+            where={"source": "TIC_Articles.pdf"},
             include=["documents", "metadatas", "distances"],
         )
         existing_texts = {c["text"] for c in candidates}
         for doc, meta, dist in zip(
-            penal_results["documents"][0],
-            penal_results["metadatas"][0],
-            penal_results["distances"][0],
+            tic_results["documents"][0],
+            tic_results["metadatas"][0],
+            tic_results["distances"][0],
         ):
             if doc not in existing_texts:
-                pc = {
-                    "text":     doc,
-                    "source":   meta["source"],
-                    "page":     meta["page"],
-                    "priority": meta["priority"],
-                    "distance": dist,
-                }
-                candidates.append(pc)
-                penal_chunks.append(pc)
+                candidates.append({
+                    "text": doc, "source": meta["source"], "page": meta["page"],
+                    "priority": meta["priority"], "distance": dist
+                })
                 existing_texts.add(doc)
-        logger.info(f"[force] Added {len(penal_results['documents'][0])} Penal Code chunks (total candidates {len(candidates)})")
+        logger.info(f"[force] Added {len(tic_results['documents'][0])} TIC chunks (total {len(candidates)})")
 
-    # 3. Cross-encoder reranking
+    # Cross-encoder reranking
     pairs = [(question, c["text"]) for c in candidates]
     scores = _cross_encoder.predict(pairs)
     for i, c in enumerate(candidates):
-        boost = PRIORITY_BOOST.get(c["priority"], 0.0)
-        c["rerank_score"] = float(scores[i]) + boost
+        c["rerank_score"] = float(scores[i]) + PRIORITY_BOOST.get(c["priority"], 0.0)
 
-    # Sort by rerank score
     candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
 
-    # 4. FORCED INCLUSION: For security queries, ensure at least FORCED_PENAL_COUNT Penal Code chunks
-    #    are in the final top MAX_CONTEXT_CHUNKS. If not, replace the lowest-ranked non-Penal Code chunks.
+    # Force at least FORCED_TIC_COUNT TIC chunks into the final top MAX_CONTEXT_CHUNKS
     if is_security_query(question):
-        # Collect top MAX_CONTEXT_CHUNKS candidates
         final = candidates[:MAX_CONTEXT_CHUNKS]
-        # Count how many Penal Code chunks are already in final
-        penal_in_final = [c for c in final if c["source"] == "2016_Algeria_fr_Code Penal.pdf"]
-        need = FORCED_PENAL_COUNT - len(penal_in_final)
+        tic_in_final = [c for c in final if c["source"] == "TIC_Articles.pdf"]
+        need = FORCED_TIC_COUNT - len(tic_in_final)
         if need > 0:
-            # Get the best Penal Code chunks not already in final, sorted by rerank score
-            available_penal = [c for c in penal_chunks if c not in final]
-            available_penal.sort(key=lambda c: c["rerank_score"], reverse=True)
-            # Replace the lowest-scoring non-Penal Code chunks in final
-            for i in range(min(need, len(available_penal))):
-                # Find lowest-scoring non-Penal Code chunk in final
+            # Get the best TIC chunks not already in final
+            available_tic = [c for c in candidates if c["source"] == "TIC_Articles.pdf" and c not in final]
+            available_tic.sort(key=lambda c: c["rerank_score"], reverse=True)
+            # Replace lowest‑scoring non‑TIC chunks in final
+            for i in range(min(need, len(available_tic))):
                 for j in range(len(final)-1, -1, -1):
-                    if final[j]["source"] != "2016_Algeria_fr_Code Penal.pdf":
-                        final[j] = available_penal[i]
+                    if final[j]["source"] != "TIC_Articles.pdf":
+                        final[j] = available_tic[i]
                         break
-            logger.info(f"[force] Forced {need} Penal Code chunks into final context")
+            logger.info(f"[force] Forced {need} TIC chunks into final context")
         candidates = final
     else:
         candidates = candidates[:MAX_CONTEXT_CHUNKS]
 
-    # Debug log
     logger.info("[rerank] Top chunks after forcing:")
     for i, c in enumerate(candidates):
         logger.info(
@@ -246,26 +222,21 @@ def _retrieve_and_rerank(question: str, expanded: str) -> list[dict]:
         )
     return candidates
 
-
 def answer_question(question: str) -> str:
     if not question.strip():
         return "Veuillez poser une question."
-
     expanded = expand_query(question)
-    chunks   = _retrieve_and_rerank(question, expanded)
-
+    chunks = _retrieve_and_rerank(question, expanded)
     if not chunks:
         return "Je n'ai pas trouvé d'information pertinente dans les textes juridiques disponibles."
 
     context_parts = []
-    sources_seen: list[str] = []
-
+    sources_seen = []
     for i, c in enumerate(chunks, 1):
         label = f"{c['source']} (page {c['page']})"
         context_parts.append(f"--- Extrait {i} | {label} ---\n{c['text']}")
         if label not in sources_seen:
             sources_seen.append(label)
-
     context_block = "\n\n".join(context_parts)
 
     user_message = (
