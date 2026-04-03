@@ -1,4 +1,4 @@
-# 🤖 DCIT Discord Bot
+# 🤖 Shellmates-Bot-Fork
 
 > ⚠️ **This repository is retired and no longer maintained.**  
 > It was my learning playground for Discord.py and bot architecture, forked from the Shellmates Discord bot.  
