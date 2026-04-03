@@ -1,5 +1,10 @@
 # 🤖 DCIT Discord Bot
 
+> ⚠️ **This repository is retired and no longer maintained.**  
+> It was my learning playground for Discord.py and bot architecture, forked from the Shellmates Discord bot.  
+> The final, production‑ready bot is now a standalone project: **[DCIT-Bot](https://github.com/YoucefDjenfi/DCIT-Bot)** – a complete RAG‑based legal assistant for Algerian cyber law.  
+> Please head there for the up‑to‑date code, documentation, and support.
+
 A Discord bot built on top of the [Shellmates](https://github.com/sara-arz/shellmates-discord-bot) community bot, extended with an AI-powered legal assistant for ESI Alger's **Citoyenneté Numérique et IA** module.
 
 ---
